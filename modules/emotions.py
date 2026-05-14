@@ -133,7 +133,7 @@ def interpolate(kfs: list[Keyframe], t: float) -> Keyframe:
 #  +60° = raised high (excited)
 #  -45° = drooped down (sad/scared)
 #
-# Neck convention (matches reachy2-sdk):
+# Neck convention (reachy-mini / create_head_pose):
 #   pitch: +20 = head up,  -20 = head down
 #   yaw:   +30 = head right, -30 = head left
 #   roll:  +15 = tilt right, -15 = tilt left
@@ -264,11 +264,11 @@ TICK = 0.04   # seconds between pose updates (~25 Hz)
 
 class EmotionEngine:
     """
-    Plays keyframe animations on Reachy's neck and antennas.
+    Plays keyframe animations on Reachy Mini's head and antennas.
 
     Parameters
     ----------
-    reachy : reachy2_sdk.ReachySDK or None
+    reachy : reachy_mini.ReachyMini or None
         None → simulation / logging only.
     """
 

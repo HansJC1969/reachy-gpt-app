@@ -133,13 +133,17 @@ def camera_loop(state: SharedState, tracker: FaceTracker, camera_idx: int) -> No
 
 def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
     logger.info("Tracking thread started")
+    was_tracking = False
     while not state.stop_event.is_set():
         with state.face_lock:
             face = state.latest_face
         if face is not None:
             tracker.update(face)
-        else:
+            was_tracking = True
+        elif was_tracking:
+            # Face just lost — center once; don't repeat at 20 Hz
             tracker.center_head()
+            was_tracking = False
         time.sleep(0.05)    # 20 Hz
     logger.info("Tracking thread stopped")
 
@@ -379,7 +383,14 @@ def main() -> None:
         reachy = build_reachy()
 
     if args.emotion_test:
-        run_emotion_test(reachy)
+        try:
+            run_emotion_test(reachy)
+        finally:
+            if reachy is not None:
+                try:
+                    reachy.__exit__(None, None, None)
+                except Exception:
+                    pass
         return
 
     # ---- normal run --------------------------------------------------------
