@@ -148,7 +148,7 @@ class ConversationManager:
     Parameters
     ----------
     model : str
-        OpenAI chat model (default: gpt-4o).
+        OpenAI chat model (default: gpt-4.1-nano).
     vision : VisionAnalyzer | None
         If provided, the get_visual_description tool is available.
     searcher : WebSearcher | None
@@ -157,7 +157,7 @@ class ConversationManager:
 
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-4.1-nano",
         vision=None,
         searcher=None,
     ) -> None:

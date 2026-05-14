@@ -165,7 +165,7 @@ def _create_summary(person_id: int, up_to_msg: int) -> None:
 
     client = openai.OpenAI(api_key=api_key)
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1-nano",
         messages=[
             {
                 "role": "system",

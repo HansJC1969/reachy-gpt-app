@@ -62,14 +62,14 @@ class VisionAnalyzer:
     interval : float
         Minimum seconds between automatic scene analyses.
     model : str
-        OpenAI model that supports vision (default: gpt-4o).
+        OpenAI model that supports vision (default: gpt-4.1-nano).
     """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         interval: float = 10.0,
-        model: str = "gpt-4o",
+        model: str = "gpt-4.1-nano",
     ) -> None:
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
