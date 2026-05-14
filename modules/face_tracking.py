@@ -1,7 +1,13 @@
 """
 Real-time face tracking using OpenCV Haar cascades.
-Moves Reachy's neck (yaw/pitch) to centre the detected face.
-Rotates the body if the face is >40% off-centre horizontally.
+Moves Reachy Mini's head to follow the detected face using look_at_image(),
+which delegates inverse kinematics to the SDK.
+Rotates the body yaw when the face is >40% off-centre horizontally.
+
+SDK: reachy_mini (ReachyMini)
+  reachy.look_at_image(u, v, duration=0)    — instant pixel-based head pointing
+  reachy.set_target_body_yaw(rad)           — absolute body yaw command
+  reachy.goto_target(head=…, body_yaw=0.0) — smooth motion; used for center_head()
 
 Can be tested without a robot:
     python -m modules.face_tracking --no-robot
@@ -22,15 +28,14 @@ logger = logging.getLogger(__name__)
 # Path to OpenCV's bundled frontalface cascade
 _CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
-# Neck joint limits (degrees)
-YAW_MIN, YAW_MAX = -45.0, 45.0
-PITCH_MIN, PITCH_MAX = -30.0, 20.0
+# Body yaw limits — from Reachy Mini safety spec
+BODY_YAW_MIN = math.radians(-160.0)
+BODY_YAW_MAX = math.radians(160.0)
 
-# Proportional gain for smooth tracking
-KP_YAW = 0.08
-KP_PITCH = 0.06
+# How much to increment body yaw per tracking call when face is off-centre
+BODY_ROTATION_STEP = math.radians(5.0)
 
-# Body-rotation triggers when face is this fraction off horizontal centre
+# Body rotation triggers when face is this fraction off horizontal centre
 BODY_ROTATION_THRESHOLD = 0.40
 
 # Minimum face detection scale and neighbours
@@ -73,7 +78,7 @@ class FaceTracker:
         """
         Parameters
         ----------
-        reachy : reachy2_sdk.ReachySDK or None
+        reachy : reachy_mini.ReachyMini or None
             Pass None to run in simulation mode (no robot).
         """
         self.reachy = reachy
@@ -81,9 +86,8 @@ class FaceTracker:
         if self._cascade.empty():
             raise RuntimeError(f"Failed to load cascade from {_CASCADE_PATH}")
 
-        # Current neck state (degrees)
-        self._yaw: float = 0.0
-        self._pitch: float = 0.0
+        # Accumulated body yaw in radians; set_target_body_yaw takes an absolute angle
+        self._body_yaw: float = 0.0
 
     # ------------------------------------------------------------------
     # Detection
@@ -117,66 +121,55 @@ class FaceTracker:
     # ------------------------------------------------------------------
 
     def update(self, face: FacePosition) -> None:
-        """
-        Given a detected face position, compute new neck angles and send
-        them to the robot (or log them in no-robot mode).
-        """
-        # Proportional control: nudge toward the target
-        self._yaw = float(np.clip(
-            self._yaw + KP_YAW * face.dx_norm * (YAW_MAX - YAW_MIN) / 2,
-            YAW_MIN, YAW_MAX,
-        ))
-        # Negative sign: face below centre → tilt head down (positive pitch on most robots)
-        self._pitch = float(np.clip(
-            self._pitch - KP_PITCH * face.dy_norm * (abs(PITCH_MIN) + PITCH_MAX) / 2,
-            PITCH_MIN, PITCH_MAX,
-        ))
-
-        logger.debug("Neck target → yaw=%.1f°  pitch=%.1f°", self._yaw, self._pitch)
-
+        """Point the head at *face* and rotate the body if it is too far off-centre."""
         if self.reachy is not None:
-            self._move_neck(self._yaw, self._pitch)
+            self._look_at_face(face)
         else:
-            logger.debug("[sim] neck yaw=%.2f pitch=%.2f", self._yaw, self._pitch)
+            logger.debug("[sim] face centre pixel (%d, %d)", face.cx, face.cy)
 
-        # Body rotation when face is far off-centre
         if abs(face.dx_norm) > BODY_ROTATION_THRESHOLD:
             self._rotate_body(face.dx_norm)
 
     def center_head(self) -> None:
-        """Return neck to neutral position."""
-        self._yaw = 0.0
-        self._pitch = 0.0
+        """Return the head and body smoothly to the neutral (forward) position."""
+        self._body_yaw = 0.0
         if self.reachy is not None:
-            self._move_neck(0.0, 0.0)
+            try:
+                from reachy_mini.utils import create_head_pose
+                self.reachy.goto_target(
+                    head=create_head_pose(yaw=0, pitch=0, degrees=True),
+                    body_yaw=0.0,
+                    duration=0.5,
+                )
+            except Exception:
+                logger.warning("Could not centre head", exc_info=True)
 
     # ------------------------------------------------------------------
     # Robot helpers
     # ------------------------------------------------------------------
 
-    def _move_neck(self, yaw: float, pitch: float) -> None:
+    def _look_at_face(self, face: FacePosition) -> None:
+        """Use SDK inverse kinematics to point the head at the face pixel."""
         try:
-            head = self.reachy.head
-            head.neck.yaw.goal_position   = yaw
-            head.neck.pitch.goal_position = pitch
-            head.send_goal_positions()
+            self.reachy.look_at_image(face.cx, face.cy, duration=0)
         except Exception:
-            logger.exception("Failed to move neck")
+            logger.exception("Failed to point head at face")
 
     def _rotate_body(self, dx_norm: float) -> None:
-        """Rotate the mobile base slightly toward the face."""
+        """Increment the absolute body yaw toward the face by BODY_ROTATION_STEP."""
+        self._body_yaw = float(np.clip(
+            self._body_yaw + math.copysign(BODY_ROTATION_STEP, dx_norm),
+            BODY_YAW_MIN,
+            BODY_YAW_MAX,
+        ))
         if self.reachy is None:
-            logger.debug("[sim] body rotate dx_norm=%.2f", dx_norm)
+            logger.debug(
+                "[sim] body_yaw=%.2f rad (%.1f°)",
+                self._body_yaw, math.degrees(self._body_yaw),
+            )
             return
         try:
-            # Positive dx_norm → face is to the right → rotate right (positive vtheta)
-            speed = 0.10  # rad/s rotation speed
-            direction = math.copysign(speed, dx_norm)
-            self.reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=direction)
-            self.reachy.mobile_base.send_speed_command()
-            time.sleep(0.15)
-            self.reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=0.0)
-            self.reachy.mobile_base.send_speed_command()
+            self.reachy.set_target_body_yaw(self._body_yaw)
         except Exception:
             logger.exception("Failed to rotate body")
 

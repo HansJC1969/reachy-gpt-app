@@ -5,7 +5,7 @@
 Connect a **Reachy Mini** robot (Pollen Robotics) to **OpenAI GPT-4o** for
 natural conversation, with:
 
-- Real-time **face tracking** — neck (yaw/pitch) and mobile-base body rotation
+- Real-time **face tracking** — head via `look_at_image()` + body yaw rotation
 - **Face recognition** — remembers specific people and animals by name
 - **Persistent memory** via SQLite — last 10 messages + GPT-generated summary per person
 
@@ -34,11 +34,12 @@ reachy-gpt-app/
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `OPENAI_API_KEY` | yes | — | OpenAI API key |
-| `REACHY_IP` | robot mode | — | IP address of Reachy Mini |
 | `CAMERA_INDEX` | no | `0` | OpenCV camera device index |
 | `FACE_CONFIDENCE_THRESHOLD` | no | `0.5` | Lower = stricter face recognition |
 | `ENCODINGS_PATH` | no | `face_encodings.pkl` | Path to pickle file |
 | `DB_PATH` | no | `reachy_memory.db` | SQLite database path |
+
+> `REACHY_IP` is no longer used. The `reachy-mini` SDK auto-detects USB (Lite) and WiFi (Wireless) connections.
 
 ## Thread architecture (`main.py`)
 
@@ -70,12 +71,15 @@ All threads share `SharedState` which uses `threading.Lock` for safe access.
 | `ÜBERRASCHUNG` | Überraschung | Schneller Ruck nach hinten, beide Antennen schnellen hoch |
 | `NEUGIER` | Neugier | Kopf neigt sich vor und zur Seite, Antennen gleichmäßig hochgerichtet |
 
-### Hardware interface
-- `reachy.head.neck.pitch` — Kopfneigung (positiv = oben)
-- `reachy.head.neck.yaw`   — Kopfdrehung (positiv = rechts)
-- `reachy.head.neck.roll`  — Kopfkippen  (positiv = rechts) — optional, wird ignoriert wenn nicht verfügbar
-- `reachy.head.l_antenna.goal_position` — linke Antenne (°)
-- `reachy.head.r_antenna.goal_position` — rechte Antenne (°)
+### Hardware interface (reachy-mini SDK)
+`_apply()` in `EmotionEngine` calls:
+```python
+from reachy_mini.utils import create_head_pose
+head_pose = create_head_pose(pitch=°, yaw=°, roll=°, degrees=True)   # 4×4 matrix
+antennas  = np.deg2rad([r_ant_deg, l_ant_deg])   # right first, radians
+reachy.set_target(head=head_pose, antennas=antennas)
+```
+Keyframe values: pitch (°), yaw (°), roll (°), l_ant (°), r_ant (°) — all degrees.
 
 ### Key classes
 
@@ -272,34 +276,46 @@ python main.py --emotion-test          # Demo all emotion animations
 
 ## Robot SDK notes
 
-Uses `reachy2-sdk`.  Key objects accessed:
+Uses `reachy-mini` (`from reachy_mini import ReachyMini`).
 
-**Neck joints** — set individual joints then call `send_goal_positions()` to transmit:
+**Connection** — SDK auto-detects USB (Lite) and WiFi (Wireless):
 ```python
-reachy.head.neck.yaw.goal_position   = degrees   # horizontal rotation
-reachy.head.neck.pitch.goal_position = degrees   # vertical tilt
-reachy.head.neck.roll.goal_position  = degrees   # roll (optional — use hasattr check)
-reachy.head.send_goal_positions()                # required: transmits all buffered goals
+from reachy_mini import ReachyMini
+# media_backend="no_media" releases camera/audio so OpenCV/sounddevice can use them
+reachy = ReachyMini(media_backend="no_media")
+reachy.__enter__()   # connect
+# … run …
+reachy.__exit__(None, None, None)  # disconnect cleanly
 ```
 
-**Antennas:**
+**Head tracking** — pixel-based; SDK handles inverse kinematics:
 ```python
-reachy.head.l_antenna.goal_position = degrees
-reachy.head.r_antenna.goal_position = degrees
+reachy.look_at_image(u, v, duration=0)   # snap head to face pixel (cx, cy)
 ```
 
-**Mobile base rotation** — set speed then send command:
+**Head + antennas** (keyframe animations):
 ```python
-reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=rad_per_s)
-reachy.mobile_base.send_speed_command()   # required: transmits the speed goal
+from reachy_mini.utils import create_head_pose
+import numpy as np
+
+head_pose = create_head_pose(pitch=10, yaw=5, roll=3, degrees=True)  # 4×4 matrix
+antennas  = np.deg2rad([right_deg, left_deg])   # SDK order: right first
+reachy.set_target(head=head_pose, antennas=antennas)   # instant
+reachy.goto_target(head=head_pose, antennas=antennas, duration=0.5)  # interpolated
 ```
 
-**Higher-level helpers** (smooth, blocking):
+**Body yaw** — absolute angle in radians:
 ```python
-reachy.head.goto(target=[roll, pitch, yaw], duration=1.0, degrees=True)
-reachy.head.rotate_by(roll=0, pitch=10, yaw=5, duration=0.5, degrees=True)
-reachy.mobile_base.rotate_by(theta, wait=True, degrees=True)
+reachy.set_target_body_yaw(rad)        # instant
+reachy.goto_target(body_yaw=rad, duration=0.5)  # smooth
 ```
+
+**Safety limits** (SDK clamps automatically):
+| Joint | Range |
+|---|---|
+| Head pitch / roll | ±40° |
+| Head yaw | ±180° |
+| Body yaw | ±160° |
 
 ## Dependencies
 

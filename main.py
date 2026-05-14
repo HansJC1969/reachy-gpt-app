@@ -318,18 +318,21 @@ def conversation_loop(
 # Entry point helpers
 # ---------------------------------------------------------------------------
 
-def build_reachy(ip: str):
+def build_reachy():
     try:
-        from reachy2_sdk import ReachySDK  # type: ignore
-        logger.info("Connecting to Reachy at %s …", ip)
-        reachy = ReachySDK(host=ip)
-        logger.info("Connected to Reachy")
+        from reachy_mini import ReachyMini  # type: ignore
+        logger.info("Connecting to Reachy Mini…")
+        # media_backend="no_media" releases the camera/audio hardware so OpenCV
+        # and sounddevice can access them directly (required by this app).
+        reachy = ReachyMini(media_backend="no_media")
+        reachy.__enter__()
+        logger.info("Connected to Reachy Mini")
         return reachy
     except ImportError:
-        logger.error("reachy2-sdk not installed — cannot connect to robot")
+        logger.error("reachy-mini not installed — cannot connect to robot")
         sys.exit(1)
     except Exception:
-        logger.exception("Failed to connect to Reachy at %s", ip)
+        logger.exception("Failed to connect to Reachy Mini")
         sys.exit(1)
 
 
@@ -373,11 +376,7 @@ def main() -> None:
 
     reachy = None
     if not args.no_robot:
-        reachy_ip = os.environ.get("REACHY_IP", "")
-        if not reachy_ip:
-            logger.error("REACHY_IP not set. Use --no-robot or set REACHY_IP in .env")
-            sys.exit(1)
-        reachy = build_reachy(reachy_ip)
+        reachy = build_reachy()
 
     if args.emotion_test:
         run_emotion_test(reachy)
@@ -469,6 +468,10 @@ def main() -> None:
                 tracker.center_head()
             except Exception:
                 logger.warning("Could not centre head on shutdown", exc_info=True)
+            try:
+                reachy.__exit__(None, None, None)
+            except Exception:
+                logger.warning("Error disconnecting from Reachy Mini", exc_info=True)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -389,21 +391,15 @@ class EmotionEngine:
             return
 
         try:
-            neck = self.reachy.head.neck
-            neck.pitch.goal_position = pose.pitch
-            neck.yaw.goal_position   = pose.yaw
-            # roll may not exist on all Reachy Mini builds
-            if hasattr(neck, "roll"):
-                neck.roll.goal_position = pose.roll
-            self.reachy.head.send_goal_positions()
+            from reachy_mini.utils import create_head_pose
+            head_pose = create_head_pose(
+                pitch=pose.pitch, yaw=pose.yaw, roll=pose.roll, degrees=True
+            )
+            # SDK antenna order: [right_rad, left_rad]
+            antennas = np.deg2rad([pose.r_ant, pose.l_ant])
+            self.reachy.set_target(head=head_pose, antennas=antennas)
         except Exception:
-            logger.debug("Neck command failed", exc_info=True)
-
-        try:
-            self.reachy.head.l_antenna.goal_position = pose.l_ant
-            self.reachy.head.r_antenna.goal_position = pose.r_ant
-        except Exception:
-            logger.debug("Antenna command failed", exc_info=True)
+            logger.debug("Motion command failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
