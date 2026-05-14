@@ -4,10 +4,28 @@ Moves Reachy Mini's head to follow the detected face using look_at_image(),
 which delegates inverse kinematics to the SDK.
 Rotates the body yaw when the face is >40% off-centre horizontally.
 
+Smooth tracking design
+----------------------
+• EMA low-pass filter (α=0.25) on raw detection coordinates to suppress jitter.
+• Dead zone: no command sent when the face is within 10% of centre in both axes.
+• Move threshold: only command when smoothed position changed ≥5% of frame.
+• Cooldown: minimum 0.6 s between head commands so each motion can complete.
+• look_at_image(duration=0.7) → minjerk interpolation, no snapping.
+• 80% position clamp: face coords clamped to ±80% of frame half-width/height
+  before passing to look_at_image, keeping head well within physical limits
+  (80% × 40° = ±32° effective pitch/roll range).
+
 SDK: reachy_mini (ReachyMini)
-  reachy.look_at_image(u, v, duration=0)    — instant pixel-based head pointing
-  reachy.set_target_body_yaw(rad)           — absolute body yaw command
-  reachy.goto_target(head=…, body_yaw=0.0) — smooth motion; used for center_head()
+  reachy.look_at_image(u, v, duration)      — smooth pixel-based head pointing
+  reachy.goto_target(body_yaw=rad, duration) — smooth body yaw
+  reachy.goto_target(head=…, body_yaw=0.0)  — used for center_head()
+
+Joint limits (from AGENTS.md — SDK clamps automatically):
+  Head pitch / roll : ±40°
+  Head yaw          : ±180°
+  Body yaw          : ±160°
+  Head-body delta   : max 65°
+  This module targets 80% of those limits via POSITION_CLAMP.
 
 Can be tested without a robot:
     python -m modules.face_tracking --no-robot
@@ -16,6 +34,7 @@ Can be tested without a robot:
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,20 +46,50 @@ logger = logging.getLogger(__name__)
 # OpenCV's bundled frontalface cascade — no download required
 _CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
-# Body yaw limits — from Reachy Mini safety spec
-BODY_YAW_MIN = math.radians(-160.0)
-BODY_YAW_MAX = math.radians(160.0)
+# ---------------------------------------------------------------------------
+# Body rotation parameters
+# ---------------------------------------------------------------------------
 
-# How much to increment body yaw per tracking call when face is off-centre
+# Physical limits from AGENTS.md; SDK clamps automatically
+BODY_YAW_MIN = math.radians(-160.0)
+BODY_YAW_MAX = math.radians( 160.0)
+
+# How much to increment absolute body yaw per rotation command
 BODY_ROTATION_STEP = math.radians(5.0)
 
-# Body rotation triggers when face is this fraction off horizontal centre
+# Body rotation triggers when smoothed face is >40% off horizontal centre
 BODY_ROTATION_THRESHOLD = 0.40
 
-# Haar detection parameters
-_SCALE_FACTOR  = 1.1
+# Minimum seconds between body-rotation commands
+BODY_ROTATION_COOLDOWN = 1.0
+
+# ---------------------------------------------------------------------------
+# Head tracking parameters
+# ---------------------------------------------------------------------------
+
+# Haar detection minimum face size (px)
+_SCALE_FACTOR   = 1.1
 _MIN_NEIGHBOURS = 5
-MIN_FACE_PX    = 60  # ignore faces smaller than this
+MIN_FACE_PX     = 60
+
+# EMA low-pass filter weight for face position (lower α → smoother / more lag)
+EMA_ALPHA = 0.25
+
+# Normalised dead zone: face inside this box around centre → no head movement
+DEAD_ZONE = 0.10          # fraction of half-frame width/height
+
+# Minimum change (normalised) from last commanded position to trigger a move
+MOVE_THRESHOLD = 0.05     # 5% of frame
+
+# Clamp face position to ±80% of half-frame before IK (keeps head within
+# ~80% of physical limits without computing explicit joint angles)
+POSITION_CLAMP = 0.80
+
+# Duration of each smooth look_at_image / goto_target motion (seconds)
+LOOK_DURATION = 0.7
+
+# Minimum gap between successive head commands (seconds)
+LOOK_COOLDOWN = 0.6
 
 
 @dataclass
@@ -85,8 +134,20 @@ class FaceTracker:
         if self._cascade.empty():
             raise RuntimeError(f"Failed to load cascade from {_CASCADE_PATH}")
 
-        # Accumulated body yaw in radians; set_target_body_yaw takes an absolute angle
+        # Accumulated body yaw (absolute, radians)
         self._body_yaw: float = 0.0
+
+        # EMA state — reset to None when face is lost
+        self._ema_cx: Optional[float] = None
+        self._ema_cy: Optional[float] = None
+
+        # Last normalised position actually commanded to the head
+        self._last_cmd_dx: float = 0.0
+        self._last_cmd_dy: float = 0.0
+
+        # Timestamps for cooldowns
+        self._last_look_time:  float = 0.0
+        self._last_body_time:  float = 0.0
 
     # ------------------------------------------------------------------
     # Detection
@@ -109,7 +170,6 @@ class FaceTracker:
         if len(faces) == 0:
             return None
 
-        # Pick the largest face (most likely the primary person)
         largest = max(faces, key=lambda f: f[2] * f[3])
         x, y, w, h = largest
         fh, fw = frame.shape[:2]
@@ -120,18 +180,66 @@ class FaceTracker:
     # ------------------------------------------------------------------
 
     def update(self, face: FacePosition) -> None:
-        """Point the head at *face* and rotate the body if it is too far off-centre."""
-        if self.reachy is not None:
-            self._look_at_face(face)
+        """
+        Apply EMA filter, dead zone, move threshold and cooldown, then
+        command the head and body only when a meaningful move is warranted.
+        """
+        # 1. Update EMA low-pass filter
+        if self._ema_cx is None:
+            self._ema_cx = float(face.cx)
+            self._ema_cy = float(face.cy)
         else:
-            logger.debug("[sim] face centre pixel (%d, %d)", face.cx, face.cy)
+            self._ema_cx = EMA_ALPHA * face.cx + (1.0 - EMA_ALPHA) * self._ema_cx
+            self._ema_cy = EMA_ALPHA * face.cy + (1.0 - EMA_ALPHA) * self._ema_cy
 
-        if abs(face.dx_norm) > BODY_ROTATION_THRESHOLD:
-            self._rotate_body(face.dx_norm)
+        # 2. Normalised offsets from smoothed position
+        dx = (self._ema_cx - face.frame_w / 2.0) / (face.frame_w / 2.0)
+        dy = (self._ema_cy - face.frame_h / 2.0) / (face.frame_h / 2.0)
+
+        # 3. Head movement: dead zone → threshold → cooldown → clamp → command
+        if abs(dx) > DEAD_ZONE or abs(dy) > DEAD_ZONE:
+            delta_dx = abs(dx - self._last_cmd_dx)
+            delta_dy = abs(dy - self._last_cmd_dy)
+            now = time.monotonic()
+
+            if (delta_dx >= MOVE_THRESHOLD or delta_dy >= MOVE_THRESHOLD) and \
+               (now - self._last_look_time >= LOOK_COOLDOWN):
+
+                # Clamp to 80% of frame half-extent before IK
+                dx_c = max(-POSITION_CLAMP, min(POSITION_CLAMP, dx))
+                dy_c = max(-POSITION_CLAMP, min(POSITION_CLAMP, dy))
+                target_cx = int((dx_c + 1.0) * face.frame_w / 2.0)
+                target_cy = int((dy_c + 1.0) * face.frame_h / 2.0)
+
+                if self.reachy is not None:
+                    self._look_at_face(target_cx, target_cy)
+                else:
+                    logger.debug(
+                        "[sim] look → norm=(%.2f, %.2f)  pixel=(%d, %d)",
+                        dx_c, dy_c, target_cx, target_cy,
+                    )
+
+                self._last_cmd_dx  = dx
+                self._last_cmd_dy  = dy
+                self._last_look_time = now
+
+        # 4. Body rotation when face is far off horizontal centre
+        now = time.monotonic()
+        if abs(dx) > BODY_ROTATION_THRESHOLD and \
+           (now - self._last_body_time >= BODY_ROTATION_COOLDOWN):
+            self._rotate_body(dx)
+            self._last_body_time = now
 
     def center_head(self) -> None:
-        """Return the head and body smoothly to the neutral (forward) position."""
-        self._body_yaw = 0.0
+        """Return the head and body smoothly to the neutral position and reset state."""
+        self._body_yaw     = 0.0
+        self._ema_cx       = None
+        self._ema_cy       = None
+        self._last_cmd_dx  = 0.0
+        self._last_cmd_dy  = 0.0
+        self._last_look_time  = 0.0
+        self._last_body_time  = 0.0
+
         if self.reachy is not None:
             try:
                 from reachy_mini.utils import create_head_pose
@@ -147,15 +255,15 @@ class FaceTracker:
     # Robot helpers
     # ------------------------------------------------------------------
 
-    def _look_at_face(self, face: FacePosition) -> None:
-        """Use SDK inverse kinematics to point the head at the face pixel."""
+    def _look_at_face(self, cx: int, cy: int) -> None:
+        """Smooth pixel-based head pointing via SDK IK."""
         try:
-            self.reachy.look_at_image(face.cx, face.cy, duration=0)
+            self.reachy.look_at_image(cx, cy, duration=LOOK_DURATION)
         except Exception:
             logger.exception("Failed to point head at face")
 
     def _rotate_body(self, dx_norm: float) -> None:
-        """Increment the absolute body yaw toward the face by BODY_ROTATION_STEP."""
+        """Increment absolute body yaw toward the face by BODY_ROTATION_STEP."""
         self._body_yaw = float(np.clip(
             self._body_yaw + math.copysign(BODY_ROTATION_STEP, dx_norm),
             BODY_YAW_MIN,
@@ -168,7 +276,7 @@ class FaceTracker:
             )
             return
         try:
-            self.reachy.set_target_body_yaw(self._body_yaw)
+            self.reachy.goto_target(body_yaw=self._body_yaw, duration=LOOK_DURATION)
         except Exception:
             logger.exception("Failed to rotate body")
 
@@ -179,11 +287,16 @@ class FaceTracker:
     @staticmethod
     def draw_face(frame: np.ndarray, face: FacePosition) -> np.ndarray:
         """Draw bounding box and cross-hair on frame (for debugging)."""
-        cv2.rectangle(frame, (face.x, face.y), (face.x + face.w, face.y + face.h), (0, 255, 0), 2)
+        cv2.rectangle(
+            frame, (face.x, face.y), (face.x + face.w, face.y + face.h),
+            (0, 255, 0), 2,
+        )
         cv2.circle(frame, (face.cx, face.cy), 4, (0, 0, 255), -1)
         label = f"dx={face.dx_norm:.2f}  dy={face.dy_norm:.2f}"
-        cv2.putText(frame, label, (face.x, face.y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(
+            frame, label, (face.x, face.y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+        )
         return frame
 
 
