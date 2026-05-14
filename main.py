@@ -20,7 +20,7 @@ CLI flags:
   --no-search         Disable web search
   --no-speech         Disable text-to-speech output
   --speech-sim        TTS synthesis but no audio playback (for testing)
-  --text-input        Use keyboard input instead of microphone (STT disabled)
+  --text-input        Use keyboard input instead of microphone (development only)
 """
 
 import argparse
@@ -74,6 +74,10 @@ VISION_INTERVAL      = 10.0    # seconds between automatic scene analyses
 IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
+
+# Disable head/body tracking until motors are separately tested and calibrated.
+# Set True only after verifying joint limits and movement feel on the physical robot.
+TRACKING_ENABLED     = False
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +291,8 @@ def conversation_loop(
     speech: Optional[SpeechEngine] = None,
     stt: Optional[SpeechToText] = None,
 ) -> None:
-    input_mode = "microphone" if stt is not None else "keyboard"
-    logger.info("Conversation thread started — input=%s (Ctrl-C to quit)", input_mode)
+    input_mode = "microphone (Whisper)" if stt is not None else "keyboard (--text-input)"
+    logger.info("Conversation thread started — input=%s", input_mode)
     current_person_id:   Optional[int] = None
     current_person_name: Optional[str] = None
 
@@ -305,13 +309,18 @@ def conversation_loop(
             logger.info("Context refreshed for '%s'", person_name)
             if current_person_id is not None:
                 emotions.play(Emotion.NEUGIER)
-                # Greet the newly recognised person aloud
                 greeting = f"Hallo{', ' + current_person_name if current_person_name != UNKNOWN_PERSON_NAME else ''}! Schön, dich zu sehen."
                 if speech:
                     speech.speak(greeting, interrupt=True)
 
         if stt is not None:
-            print(f"[{current_person_name}] Sprechen…", flush=True)
+            # Wait for any ongoing TTS to finish so the mic doesn't capture
+            # Reachy's own voice, then give the speaker a moment to settle.
+            if speech:
+                speech.wait_until_done(timeout=60.0)
+                time.sleep(0.4)
+
+            print(f"[{current_person_name}] Sprechen… (Stille zum Beenden)", flush=True)
             try:
                 user_input = stt.listen_and_transcribe(
                     timeout=30.0, stop_event=state.stop_event
@@ -319,9 +328,13 @@ def conversation_loop(
             except KeyboardInterrupt:
                 state.stop_event.set()
                 break
+
+            if state.stop_event.is_set():
+                break
             if user_input is None:
-                # Timed out or stop_event set — check stop_event before looping
+                logger.debug("STT: no speech detected — listening again")
                 continue
+
             print(f"[{current_person_name}] Du: {user_input}", flush=True)
         else:
             try:
@@ -338,11 +351,11 @@ def conversation_loop(
         if user_input.lower() in {"quit", "exit", ":q", "tschüss", "auf wiedersehen"}:
             if speech:
                 speech.speak("Tschüss! Bis zum nächsten Mal.", interrupt=True)
-                speech.wait_until_done(timeout=5.0)
+                speech.wait_until_done(timeout=8.0)
             state.stop_event.set()
             break
 
-        # Stop ongoing speech — user is already talking
+        # If user started speaking while Reachy was talking, interrupt TTS
         if speech:
             speech.stop()
 
@@ -523,7 +536,8 @@ def main() -> None:
     # Use None as target sentinel; the loop below skips those entries.
     thread_specs = [
         ("camera",       True,  camera_loop,                               (state, tracker, args.camera, reachy)),
-        ("tracking",     True,  tracking_loop,                              (state, tracker)),
+        # tracking_loop is disabled until motors are tested and calibrated
+        ("tracking",     True,  tracking_loop if TRACKING_ENABLED else None, (state, tracker)),
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
         ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
         ("idle",         True,  idle_loop,                                  (state, emotions)),

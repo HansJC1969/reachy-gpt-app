@@ -7,11 +7,17 @@ On robot (reachy is not None):
     reachy.media.start_recording() / get_audio_sample() / stop_recording()
     SDK LOCAL backend — GStreamer audio IPC, 16 kHz float32 stereo.
 
+    Voice activity detection uses reachy.media.get_DoA() which returns
+    (angle, is_speech_detected) — the hardware DSP speech detector is more
+    reliable than energy thresholds.  Energy RMS is used as a fallback guard
+    to filter out constant background noise when DoA reports no speech.
+
 Simulation (reachy is None):
     sounddevice InputStream from the default system microphone.
+    Energy RMS VAD only (no DoA available).
 
-Both paths share the same energy-based VAD loop:
-  1. Discard frames until RMS > SPEECH_THRESHOLD (speech onset).
+Both paths share _vad_loop():
+  1. Discard frames until speech is detected (DoA flag or RMS > threshold).
   2. Record through trailing silence until SILENCE_DURATION seconds of
      quiet have elapsed.
   3. Send WAV bytes to OpenAI Whisper-1, return the transcript.
@@ -29,7 +35,7 @@ import os
 import threading
 import time
 import wave
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import openai
@@ -44,16 +50,16 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE   = 16_000          # Hz — matches Reachy Mini SDK output
 CHUNK_SAMPLES = 1_600           # 0.1 s per VAD chunk
 
-# Energy threshold for speech onset/offset (RMS in float32 [-1, 1] range)
+# Energy threshold — fallback guard when DoA flag is unavailable (sounddevice)
 SPEECH_THRESHOLD = 0.02
 
 # Seconds of consecutive silence before recording ends
-SILENCE_DURATION  = 1.2
-SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # ≈ 12
+SILENCE_DURATION  = 1.5
+SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # ≈ 15
 
 # Discard recordings shorter than this (spurious noise triggers)
-MIN_SPEECH_DURATION = 0.3
-MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # ≈ 3
+MIN_SPEECH_DURATION = 0.4
+MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # ≈ 4
 
 # Hard timeout waiting for speech
 MAX_DURATION = 30.0
@@ -122,7 +128,12 @@ class SpeechToText:
         time.sleep(0.15)
 
         try:
-            return self._vad_loop(self._sdk_chunk, timeout, stop_event)
+            return self._vad_loop(
+                self._sdk_chunk,
+                timeout,
+                stop_event,
+                is_speech_fn=self._sdk_is_speech,
+            )
         finally:
             try:
                 self._reachy.media.stop_recording()
@@ -142,6 +153,18 @@ class SpeechToText:
         # SDK returns (samples, channels) — mix down to mono
         mono = data.mean(axis=1) if data.ndim == 2 else data
         return mono.astype(np.float32)
+
+    def _sdk_is_speech(self) -> bool:
+        """
+        Use the SDK's hardware DSP speech detector via get_DoA().
+        Falls back to False on any error so recording keeps running.
+        """
+        try:
+            _angle, is_speech = self._reachy.media.get_DoA()
+            return bool(is_speech)
+        except Exception:
+            logger.debug("get_DoA() error", exc_info=True)
+            return False
 
     # ── sounddevice fallback ──────────────────────────────────────────────────
 
@@ -176,7 +199,8 @@ class SpeechToText:
                 return None
 
         try:
-            return self._vad_loop(chunk_fn, timeout, stop_event)
+            # sounddevice path: no DoA available, use energy RMS only
+            return self._vad_loop(chunk_fn, timeout, stop_event, is_speech_fn=None)
         finally:
             try:
                 stream.stop()
@@ -188,19 +212,25 @@ class SpeechToText:
 
     def _vad_loop(
         self,
-        chunk_fn,
+        chunk_fn: Callable[[], Optional[np.ndarray]],
         timeout: float,
         stop_event: Optional[threading.Event],
+        is_speech_fn: Optional[Callable[[], bool]] = None,
     ) -> Optional[np.ndarray]:
         """
-        Read audio chunks from *chunk_fn*, apply energy VAD, and return
-        a mono float32 array covering the detected utterance, or None.
+        Read audio chunks from *chunk_fn*, apply VAD, and return a mono
+        float32 array covering the detected utterance, or None.
+
+        When *is_speech_fn* is provided (SDK path), the hardware DSP result
+        gates speech onset/offset.  Energy RMS is still checked as a secondary
+        guard to suppress constant background noise that the DSP might miss.
+        When *is_speech_fn* is None (sounddevice path), only RMS is used.
         """
-        chunks:         list[np.ndarray] = []
-        speech_chunks   = 0
-        silence_chunks  = 0
-        speech_started  = False
-        deadline        = time.monotonic() + timeout
+        chunks:        list[np.ndarray] = []
+        speech_chunks  = 0
+        silence_chunks = 0
+        speech_started = False
+        deadline       = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -212,10 +242,17 @@ class SpeechToText:
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))
 
-            if rms >= SPEECH_THRESHOLD:
+            if is_speech_fn is not None:
+                # SDK path: primary detector is hardware DSP; RMS guards noise floor
+                is_speech = is_speech_fn() and rms > (SPEECH_THRESHOLD * 0.5)
+            else:
+                # Simulation path: energy RMS only
+                is_speech = rms >= SPEECH_THRESHOLD
+
+            if is_speech:
                 if not speech_started:
                     speech_started = True
-                    logger.debug("STT: speech onset (RMS=%.4f)", rms)
+                    logger.debug("STT: speech onset (rms=%.4f)", rms)
                     print("  [aufnehmen…]", flush=True)
                 silence_chunks = 0
                 speech_chunks += 1
@@ -288,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--loops", type=int, default=3, help="Number of listen/transcribe loops")
     args = parser.parse_args()
 
-    stt = SpeechToText(reachy=None)   # no robot object in standalone mode
+    stt = SpeechToText(reachy=None)
     print(f"Speak into the {'system microphone' if args.no_robot else 'Reachy microphone'}.")
     print("Press Ctrl-C to stop.\n")
 
