@@ -6,11 +6,11 @@ Rotates the body yaw when the face is >40% off-centre horizontally.
 
 Smooth tracking design
 ----------------------
-• EMA low-pass filter (α=0.25) on raw detection coordinates to suppress jitter.
-• Dead zone: no command sent when the face is within 10% of centre in both axes.
+• EMA low-pass filter (α=0.30) on raw detection coordinates to suppress jitter.
+• Dead zone: no command sent when the face is within 15% of centre in both axes.
 • Move threshold: only command when smoothed position changed ≥5% of frame.
-• Cooldown: minimum 0.6 s between head commands so each motion can complete.
-• look_at_image(duration=0.7) → minjerk interpolation, no snapping.
+• Cooldown: minimum 1.5 s between head commands so each motion can complete.
+• look_at_image(duration=1.5) → minjerk interpolation, no snapping.
 • 80% position clamp: face coords clamped to ±80% of frame half-width/height
   before passing to look_at_image, keeping head well within physical limits
   (80% × 40° = ±32° effective pitch/roll range).
@@ -73,10 +73,10 @@ _MIN_NEIGHBOURS = 5
 MIN_FACE_PX     = 60
 
 # EMA low-pass filter weight for face position (lower α → smoother / more lag)
-EMA_ALPHA = 0.25
+EMA_ALPHA = 0.30
 
 # Normalised dead zone: face inside this box around centre → no head movement
-DEAD_ZONE = 0.10          # fraction of half-frame width/height
+DEAD_ZONE = 0.15          # fraction of half-frame width/height
 
 # Minimum change (normalised) from last commanded position to trigger a move
 MOVE_THRESHOLD = 0.05     # 5% of frame
@@ -86,10 +86,11 @@ MOVE_THRESHOLD = 0.05     # 5% of frame
 POSITION_CLAMP = 0.80
 
 # Duration of each smooth look_at_image / goto_target motion (seconds)
-LOOK_DURATION = 0.7
+LOOK_DURATION = 1.5
 
 # Minimum gap between successive head commands (seconds)
-LOOK_COOLDOWN = 0.6
+# Must be >= LOOK_DURATION so motions don't pile up
+LOOK_COOLDOWN = 1.5
 
 
 @dataclass
