@@ -8,9 +8,9 @@ On robot (reachy is not None):
     SDK LOCAL backend — GStreamer audio IPC, 16 kHz float32 stereo.
 
     Voice activity detection uses reachy.media.get_DoA() which returns
-    (angle, is_speech_detected) — the hardware DSP speech detector is more
-    reliable than energy thresholds.  Energy RMS is used as a fallback guard
-    to filter out constant background noise when DoA reports no speech.
+    (angle, is_speech_detected).  DoA is treated as an OR signal: speech is
+    detected when EITHER the DSP flags it OR the RMS exceeds the threshold.
+    This prevents the DoA being a hard gate that blocks all speech.
 
 Simulation (reachy is None):
     sounddevice InputStream from the default system microphone.
@@ -20,8 +20,8 @@ Both paths share _vad_loop():
   1. Discard frames until speech is detected (DoA flag or RMS > threshold).
   2. Record through trailing silence until SILENCE_DURATION seconds of
      quiet have elapsed.
-  3. Discard if speech content < MIN_SPEECH_DURATION (2 s) — prevents
-     noise bursts from being sent to Whisper and causing hallucinations.
+  3. Stop recording after MAX_RECORD_DURATION (10 s) to prevent runaway capture.
+  4. Discard if speech content < MIN_SPEECH_DURATION (0.5 s).
   4. Send WAV bytes to OpenAI Whisper-1 with language=WHISPER_LANGUAGE
      ("de" by default) to prevent language-guessing misreads.
 
@@ -53,24 +53,28 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE   = 16_000          # Hz — matches Reachy Mini SDK output
 CHUNK_SAMPLES = 1_600           # 0.1 s per VAD chunk
 
-# Energy threshold — fallback guard when DoA flag is unavailable (sounddevice)
-SPEECH_THRESHOLD = 0.02
+# RMS energy threshold for speech onset/offset.
+# 0.005 works at ~0.5–1 m conversational distance with Reachy's mic array.
+# Raise if background noise is being picked up; lower if speech isn't detected.
+SPEECH_THRESHOLD = float(os.environ.get("STT_THRESHOLD", "0.005"))
 
-# Seconds of consecutive silence before recording ends
+# Seconds of consecutive silence that ends a recording
 SILENCE_DURATION  = 0.8
 SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # = 8
 
-# Minimum speech before transcription is attempted.
-# 2.0 s prevents short noise bursts (fans, clicks, ambient sound) from being
-# sent to Whisper, which causes hallucinations like "neun Kirchen" for noise.
-MIN_SPEECH_DURATION = 2.0
-MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 20
+# Minimum speech content before Whisper is called (discard very short bursts)
+MIN_SPEECH_DURATION = 0.5
+MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 5
+
+# Maximum recording time after speech onset (prevents runaway capture)
+MAX_RECORD_DURATION = 10.0
+MAX_RECORD_CHUNKS   = int(MAX_RECORD_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 100
 
 # Whisper language hint — "de" stops Whisper toggling between German and
 # English phonemes, fixing misreadings of German proper nouns.
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "de")
 
-# Hard timeout waiting for speech
+# Hard timeout waiting for speech onset
 MAX_DURATION = 30.0
 
 
@@ -117,7 +121,8 @@ class SpeechToText:
             return None
 
         duration = len(audio) / SAMPLE_RATE
-        logger.debug("STT: %.1f s captured — sending to Whisper", duration)
+        logger.info("STT: %.1f s aufgenommen — sende an Whisper (language=%s)",
+                    duration, WHISPER_LANGUAGE)
         return self._transcribe(audio)
 
     # ── SDK audio path ────────────────────────────────────────────────────────
@@ -230,16 +235,21 @@ class SpeechToText:
         Read audio chunks from *chunk_fn*, apply VAD, and return a mono
         float32 array covering the detected utterance, or None.
 
-        When *is_speech_fn* is provided (SDK path), the hardware DSP result
-        gates speech onset/offset.  Energy RMS is still checked as a secondary
-        guard to suppress constant background noise that the DSP might miss.
-        When *is_speech_fn* is None (sounddevice path), only RMS is used.
+        Speech detection (SDK path):
+          DoA flag OR RMS >= threshold — either signal is sufficient.
+          Using OR instead of AND prevents a conservative DSP from blocking
+          all speech when the mic array can hear the user fine.
+
+        Speech detection (sounddevice path):
+          RMS >= threshold only.
         """
         chunks:        list[np.ndarray] = []
         speech_chunks  = 0
         silence_chunks = 0
         speech_started = False
         deadline       = time.monotonic() + timeout
+
+        print("  [warte auf Sprache…]", flush=True)
 
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -252,35 +262,42 @@ class SpeechToText:
             rms = float(np.sqrt(np.mean(chunk ** 2)))
 
             if is_speech_fn is not None:
-                # SDK path: hardware DSP must flag speech AND audio must exceed
-                # 80% of the RMS threshold to suppress ambient background noise.
-                is_speech = is_speech_fn() and rms > (SPEECH_THRESHOLD * 0.8)
+                # SDK path: DoA OR energy — either signal is enough.
+                is_speech = is_speech_fn() or rms >= SPEECH_THRESHOLD
             else:
-                # Simulation path: energy RMS only
                 is_speech = rms >= SPEECH_THRESHOLD
 
             if is_speech:
                 if not speech_started:
                     speech_started = True
-                    logger.debug("STT: speech onset (rms=%.4f)", rms)
-                    print("  [aufnehmen…]", flush=True)
+                    logger.info("STT: Sprache erkannt (rms=%.4f, threshold=%.4f)",
+                                rms, SPEECH_THRESHOLD)
+                    print("  [Sprache erkannt — aufnehmen…]", flush=True)
                 silence_chunks = 0
                 speech_chunks += 1
                 chunks.append(chunk)
 
+                # Hard cap: stop recording after MAX_RECORD_DURATION
+                if speech_chunks >= MAX_RECORD_CHUNKS:
+                    logger.info("STT: max Aufnahmedauer erreicht (%.0fs)", MAX_RECORD_DURATION)
+                    print(f"  [Max. {MAX_RECORD_DURATION:.0f}s — sende an Whisper…]", flush=True)
+                    break
+
             elif speech_started:
-                # Append silence so Whisper hears natural sentence endings
                 silence_chunks += 1
                 chunks.append(chunk)
                 if silence_chunks >= SILENCE_CHUNKS:
-                    break   # enough trailing silence — utterance complete
+                    speech_secs = speech_chunks * CHUNK_SAMPLES / SAMPLE_RATE
+                    print(f"  [Aufnahme beendet ({speech_secs:.1f}s) — transkribiere…]",
+                          flush=True)
+                    break
 
             # else: still waiting for speech onset — discard chunk
 
         if not speech_started or speech_chunks < MIN_SPEECH_CHUNKS:
             logger.debug(
-                "STT: discarding (speech_chunks=%d, min=%d)",
-                speech_chunks, MIN_SPEECH_CHUNKS,
+                "STT: verworfen (speech_chunks=%d, min=%d, threshold=%.4f)",
+                speech_chunks, MIN_SPEECH_CHUNKS, SPEECH_THRESHOLD,
             )
             return None
 
