@@ -1,5 +1,5 @@
 """
-Real-time face tracking using OpenCV Haar cascades.
+Real-time face tracking using MediaPipe Face Detection.
 Moves Reachy Mini's head to follow the detected face using look_at_image(),
 which delegates inverse kinematics to the SDK.
 Rotates the body yaw when the face is >40% off-centre horizontally.
@@ -20,12 +20,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 import cv2
+import mediapipe as mp
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Path to OpenCV's bundled frontalface cascade
-_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+_mp_face_detection = mp.solutions.face_detection
 
 # Body yaw limits — from Reachy Mini safety spec
 BODY_YAW_MIN = math.radians(-160.0)
@@ -37,10 +37,8 @@ BODY_ROTATION_STEP = math.radians(5.0)
 # Body rotation triggers when face is this fraction off horizontal centre
 BODY_ROTATION_THRESHOLD = 0.40
 
-# Minimum face detection scale and neighbours
-SCALE_FACTOR = 1.1
-MIN_NEIGHBOURS = 5
-MIN_FACE_PX = 60  # ignore faces smaller than this
+# Ignore detections whose bounding box is smaller than this (pixels)
+MIN_FACE_PX = 60
 
 
 @dataclass
@@ -81,9 +79,11 @@ class FaceTracker:
             Pass None to run in simulation mode (no robot).
         """
         self.reachy = reachy
-        self._cascade = cv2.CascadeClassifier(_CASCADE_PATH)
-        if self._cascade.empty():
-            raise RuntimeError(f"Failed to load cascade from {_CASCADE_PATH}")
+        # model_selection=0: optimised for short range (< 2 m) — ideal for Reachy
+        self._detector = _mp_face_detection.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=0.5,
+        )
 
         # Accumulated body yaw in radians; set_target_body_yaw takes an absolute angle
         self._body_yaw: float = 0.0
@@ -93,27 +93,38 @@ class FaceTracker:
     # ------------------------------------------------------------------
 
     def detect_face(self, frame: np.ndarray) -> Optional[FacePosition]:
-        """Return the largest detected face, or None."""
+        """Return the most-confident detected face, or None."""
         if frame is None or frame.size == 0:
             return None
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
+        try:
+            fh, fw = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self._detector.process(rgb)
+            if not results.detections:
+                return None
 
-        faces = self._cascade.detectMultiScale(
-            gray,
-            scaleFactor=SCALE_FACTOR,
-            minNeighbors=MIN_NEIGHBOURS,
-            minSize=(MIN_FACE_PX, MIN_FACE_PX),
-        )
+            # Pick the detection with the highest confidence score
+            best = max(results.detections, key=lambda d: d.score[0])
+            bb = best.location_data.relative_bounding_box
 
-        if len(faces) == 0:
+            x = int(bb.xmin * fw)
+            y = int(bb.ymin * fh)
+            w = int(bb.width  * fw)
+            h = int(bb.height * fh)
+
+            # Clamp to frame bounds
+            x = max(0, min(x, fw - 1))
+            y = max(0, min(y, fh - 1))
+            w = max(0, min(w, fw - x))
+            h = max(0, min(h, fh - y))
+
+            if w < MIN_FACE_PX or h < MIN_FACE_PX:
+                return None
+
+            return FacePosition(x=x, y=y, w=w, h=h, frame_w=fw, frame_h=fh)
+        except Exception:
+            logger.debug("detect_face() failed", exc_info=True)
             return None
-
-        # Pick the largest face (most likely the primary person)
-        largest = max(faces, key=lambda f: f[2] * f[3])
-        x, y, w, h = largest
-        fh, fw = frame.shape[:2]
-        return FacePosition(x=x, y=y, w=w, h=h, frame_w=fw, frame_h=fh)
 
     # ------------------------------------------------------------------
     # Tracking
