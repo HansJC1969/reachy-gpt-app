@@ -263,7 +263,7 @@ class SpeechEngine:
                     sd.stop()
                     return
                 chunk = audio[start : start + CHUNK]
-                sd.play(chunk.reshape(-1, 1), samplerate=SAMPLE_RATE, dtype="int16")
+                sd.play(chunk, samplerate=SAMPLE_RATE)
                 sd.wait()
         except Exception:
             logger.exception("Audio playback failed")
