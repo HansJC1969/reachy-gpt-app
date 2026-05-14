@@ -20,6 +20,7 @@ CLI flags:
   --no-search         Disable web search
   --no-speech         Disable text-to-speech output
   --speech-sim        TTS synthesis but no audio playback (for testing)
+  --text-input        Use keyboard input instead of microphone (STT disabled)
 """
 
 import argparse
@@ -61,6 +62,7 @@ from modules.memory import (
     build_memory_context,
 )
 from modules.speech import SpeechEngine, detect_language, sounddevice_available
+from modules.stt import SpeechToText
 from modules.vision import VisionAnalyzer
 from modules.websearch import WebSearcher
 
@@ -283,8 +285,10 @@ def conversation_loop(
     convo: ConversationManager,
     emotions: EmotionEngine,
     speech: Optional[SpeechEngine] = None,
+    stt: Optional[SpeechToText] = None,
 ) -> None:
-    logger.info("Conversation thread started — type to talk (Ctrl-C to quit)")
+    input_mode = "microphone" if stt is not None else "keyboard"
+    logger.info("Conversation thread started — input=%s (Ctrl-C to quit)", input_mode)
     current_person_id:   Optional[int] = None
     current_person_name: Optional[str] = None
 
@@ -306,14 +310,28 @@ def conversation_loop(
                 if speech:
                     speech.speak(greeting, interrupt=True)
 
-        try:
-            user_input = input(f"[{current_person_name}] Du: ").strip()
-        except EOFError:
-            state.stop_event.set()
-            break
-        except KeyboardInterrupt:
-            state.stop_event.set()
-            break
+        if stt is not None:
+            print(f"[{current_person_name}] Sprechen…", flush=True)
+            try:
+                user_input = stt.listen_and_transcribe(
+                    timeout=30.0, stop_event=state.stop_event
+                )
+            except KeyboardInterrupt:
+                state.stop_event.set()
+                break
+            if user_input is None:
+                # Timed out or stop_event set — check stop_event before looping
+                continue
+            print(f"[{current_person_name}] Du: {user_input}", flush=True)
+        else:
+            try:
+                user_input = input(f"[{current_person_name}] Du: ").strip()
+            except EOFError:
+                state.stop_event.set()
+                break
+            except KeyboardInterrupt:
+                state.stop_event.set()
+                break
 
         if not user_input:
             continue
@@ -410,6 +428,7 @@ def main() -> None:
     parser.add_argument("--no-search",    action="store_true", help="Disable web search")
     parser.add_argument("--no-speech",    action="store_true", help="Disable text-to-speech output")
     parser.add_argument("--speech-sim",   action="store_true", help="TTS synthesis without audio playback")
+    parser.add_argument("--text-input",   action="store_true", help="Use keyboard instead of microphone")
     args = parser.parse_args()
 
     # ---- one-shot commands -------------------------------------------------
@@ -473,6 +492,15 @@ def main() -> None:
         except Exception:
             logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
 
+    # Speech-to-text
+    stt: Optional[SpeechToText] = None
+    if not args.text_input:
+        try:
+            stt = SpeechToText(reachy=reachy)
+            logger.info("STT enabled (%s)", "Reachy mic" if reachy is not None else "system mic")
+        except Exception:
+            logger.warning("STT disabled (check OPENAI_API_KEY or sounddevice installation)")
+
     tracker    = FaceTracker(reachy=reachy)
     recognizer = FaceRecognitionModule()
     emotions   = EmotionEngine(reachy=reachy)
@@ -494,7 +522,7 @@ def main() -> None:
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
         ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
         ("idle",         True,  idle_loop,                                  (state, emotions)),
-        ("conversation", False, conversation_loop,                          (state, convo, emotions, speech)),
+        ("conversation", False, conversation_loop,                          (state, convo, emotions, speech, stt)),
     ]
 
     threads = []
