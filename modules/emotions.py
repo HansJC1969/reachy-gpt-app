@@ -395,6 +395,7 @@ class EmotionEngine:
             # roll may not exist on all Reachy Mini builds
             if hasattr(neck, "roll"):
                 neck.roll.goal_position = pose.roll
+            self.reachy.head.send_goal_positions()
         except Exception:
             logger.debug("Neck command failed", exc_info=True)
 

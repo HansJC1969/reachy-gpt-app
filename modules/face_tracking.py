@@ -157,8 +157,9 @@ class FaceTracker:
     def _move_neck(self, yaw: float, pitch: float) -> None:
         try:
             head = self.reachy.head
-            head.neck.yaw.goal_position = yaw
+            head.neck.yaw.goal_position   = yaw
             head.neck.pitch.goal_position = pitch
+            head.send_goal_positions()
         except Exception:
             logger.exception("Failed to move neck")
 
@@ -168,12 +169,14 @@ class FaceTracker:
             logger.debug("[sim] body rotate dx_norm=%.2f", dx_norm)
             return
         try:
-            # Positive dx_norm → face is to the right → rotate right (positive)
-            speed = 0.10  # m/s tangential speed
+            # Positive dx_norm → face is to the right → rotate right (positive vtheta)
+            speed = 0.10  # rad/s rotation speed
             direction = math.copysign(speed, dx_norm)
-            self.reachy.mobile_base.set_speed(vx=0.0, vy=0.0, vtheta=direction)
+            self.reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=direction)
+            self.reachy.mobile_base.send_speed_command()
             time.sleep(0.15)
-            self.reachy.mobile_base.set_speed(vx=0.0, vy=0.0, vtheta=0.0)
+            self.reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=0.0)
+            self.reachy.mobile_base.send_speed_command()
         except Exception:
             logger.exception("Failed to rotate body")
 

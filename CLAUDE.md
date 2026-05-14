@@ -273,9 +273,33 @@ python main.py --emotion-test          # Demo all emotion animations
 ## Robot SDK notes
 
 Uses `reachy2-sdk`.  Key objects accessed:
-- `reachy.head.neck.yaw.goal_position` — horizontal neck rotation (°)
-- `reachy.head.neck.pitch.goal_position` — vertical neck tilt (°)
-- `reachy.mobile_base.set_speed(vx, vy, vtheta)` — body rotation
+
+**Neck joints** — set individual joints then call `send_goal_positions()` to transmit:
+```python
+reachy.head.neck.yaw.goal_position   = degrees   # horizontal rotation
+reachy.head.neck.pitch.goal_position = degrees   # vertical tilt
+reachy.head.neck.roll.goal_position  = degrees   # roll (optional — use hasattr check)
+reachy.head.send_goal_positions()                # required: transmits all buffered goals
+```
+
+**Antennas:**
+```python
+reachy.head.l_antenna.goal_position = degrees
+reachy.head.r_antenna.goal_position = degrees
+```
+
+**Mobile base rotation** — set speed then send command:
+```python
+reachy.mobile_base.set_goal_speed(vx=0.0, vy=0.0, vtheta=rad_per_s)
+reachy.mobile_base.send_speed_command()   # required: transmits the speed goal
+```
+
+**Higher-level helpers** (smooth, blocking):
+```python
+reachy.head.goto(target=[roll, pitch, yaw], duration=1.0, degrees=True)
+reachy.head.rotate_by(roll=0, pitch=10, yaw=5, duration=0.5, degrees=True)
+reachy.mobile_base.rotate_by(theta, wait=True, degrees=True)
+```
 
 ## Dependencies
 
