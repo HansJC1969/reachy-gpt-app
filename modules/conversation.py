@@ -16,6 +16,7 @@ Standalone test:
 import json
 import logging
 import os
+import re
 from typing import Optional, Generator
 
 import numpy as np
@@ -124,6 +125,24 @@ _VISION_TOOL: dict = {
 }
 
 
+# ── Sentence splitting for streaming TTS ─────────────────────────────────────
+
+# Split on sentence-ending punctuation followed by whitespace.
+# German/English prose rarely has abbreviations that cause false splits in TTS.
+_SENT_SPLIT = re.compile(r'(?<=[.!?…])\s+')
+
+
+def _split_sentences(buf: str) -> tuple[list[str], str]:
+    """
+    Extract complete sentences from *buf*.
+    Returns (list_of_complete_sentences, remaining_incomplete_fragment).
+    """
+    parts = _SENT_SPLIT.split(buf)
+    if len(parts) <= 1:
+        return [], buf
+    return [p.strip() for p in parts[:-1] if p.strip()], parts[-1]
+
+
 class ConversationManager:
     """
     Parameters
@@ -138,7 +157,7 @@ class ConversationManager:
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str = "gpt-4o-mini",
         vision=None,
         searcher=None,
     ) -> None:
@@ -153,6 +172,9 @@ class ConversationManager:
         self._memory_context: str = ""
         self._current_person: Optional[str] = None
         self._latest_frame: Optional[np.ndarray] = None
+        # Set by stream_reply_sentences() for caller access after iteration
+        self.last_emotion: Emotion = Emotion.NEUTRAL
+        self.last_reply:   str     = ""
 
     # ------------------------------------------------------------------
     # Frame injection (called by main before each chat)
@@ -302,6 +324,160 @@ class ConversationManager:
         self._session_history.append({"role": "assistant", "content": reply})
         logger.debug("Reply: %r  emotion: %s", reply[:80], emotion.value)
         return reply, emotion
+
+    def stream_reply_sentences(
+        self,
+        user_input: str,
+        history_override: Optional[list[dict]] = None,
+    ) -> Generator[str, None, None]:
+        """
+        Stream the GPT reply, yielding one complete sentence at a time.
+
+        Sentences are yielded as soon as the trailing punctuation + space
+        arrives in the stream, so TTS can start on the first sentence while
+        GPT is still generating the rest.
+
+        Tool calls are handled transparently:
+          • express_emotion  → captured into self.last_emotion, no extra round-trip
+          • web_search / get_visual_description → tool executes, then the follow-up
+            response is also streamed sentence-by-sentence
+
+        After the generator is exhausted:
+          self.last_emotion  — Emotion signalled by GPT
+          self.last_reply    — full concatenated reply (for memory / logging)
+        """
+        messages = self._build_messages(user_input, history_override)
+        tools = self._active_tools()
+        self.last_emotion = Emotion.NEUTRAL
+        self.last_reply = ""
+        reply_parts: list[str] = []
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            tool_calls_acc: dict[int, dict] = {}
+            text_chunks:    list[str]       = []
+            sentence_buf = ""
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=400,
+                temperature=0.8,
+                stream=True,
+            )
+
+            for chunk in response:
+                delta = chunk.choices[0].delta
+
+                # Stream text → yield complete sentences immediately
+                if delta.content:
+                    text_chunks.append(delta.content)
+                    sentence_buf += delta.content
+                    sentences, sentence_buf = _split_sentences(sentence_buf)
+                    for s in sentences:
+                        reply_parts.append(s)
+                        yield s
+
+                # Accumulate tool-call deltas (id + name in first chunk, arguments build up)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc_delta.id:
+                            tool_calls_acc[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_acc[idx]["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+            # Flush any sentence fragment left in the buffer
+            remaining = sentence_buf.strip()
+            if remaining:
+                reply_parts.append(remaining)
+                yield remaining
+
+            # No tool calls → GPT is done
+            if not tool_calls_acc:
+                break
+
+            # Append assistant message (content + tool_calls) to history
+            full_text = "".join(text_chunks)
+            messages.append({
+                "role": "assistant",
+                "content": full_text or None,
+                "tool_calls": [
+                    {
+                        "id":       tc["id"],
+                        "type":     "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls_acc.values()
+                ],
+            })
+
+            # Execute tool calls and collect results
+            tool_results: list[dict] = []
+            has_real_tool = False
+
+            for tc in tool_calls_acc.values():
+                fn = tc["name"]
+                try:
+                    args = json.loads(tc["arguments"])
+                except json.JSONDecodeError:
+                    args = {}
+
+                try:
+                    if fn == "express_emotion":
+                        self.last_emotion = parse_emotion(args.get("emotion", "neutral"))
+                        result = "ok"
+
+                    elif fn == "web_search":
+                        has_real_tool = True
+                        query = args.get("query", "")
+                        logger.info("Tool: web_search(%r)", query)
+                        result = (
+                            self._searcher.search_and_format(query)
+                            if self._searcher else "Web search not available."
+                        )
+
+                    elif fn == "get_visual_description":
+                        has_real_tool = True
+                        question = args.get("question", "")
+                        logger.info("Tool: get_visual_description(%r)", question)
+                        if self._vision and self._latest_frame is not None:
+                            result = self._vision.analyze_on_command(
+                                self._latest_frame, question or "What do you see?"
+                            )
+                        elif self._vision:
+                            result = "No camera frame available."
+                        else:
+                            result = "Visual analysis not available."
+
+                    else:
+                        result = f"Unknown tool: {fn}"
+
+                except Exception:
+                    logger.exception("Tool execution failed for '%s'", fn)
+                    result = f"Tool '{fn}' encountered an error."
+
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            messages.extend(tool_results)
+
+            if not has_real_tool:
+                break  # express_emotion only — text already yielded, done
+
+        self.last_reply = " ".join(reply_parts)
+        self._session_history.append({"role": "user",      "content": user_input})
+        self._session_history.append({"role": "assistant", "content": self.last_reply})
+        logger.debug("Stream done: %r  emotion=%s", self.last_reply[:80], self.last_emotion.value)
 
     def stream_chat(self, user_input: str) -> Generator[str, None, None]:
         """Streaming text-only variant (no tool calls, no emotion)."""

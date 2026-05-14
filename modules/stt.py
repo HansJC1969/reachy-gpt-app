@@ -57,8 +57,8 @@ CHUNK_SAMPLES = 1_600           # 0.1 s per VAD chunk
 SPEECH_THRESHOLD = 0.02
 
 # Seconds of consecutive silence before recording ends
-SILENCE_DURATION  = 1.5
-SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # ≈ 15
+SILENCE_DURATION  = 0.8
+SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # = 8
 
 # Minimum speech before transcription is attempted.
 # 2.0 s prevents short noise bursts (fans, clicks, ambient sound) from being

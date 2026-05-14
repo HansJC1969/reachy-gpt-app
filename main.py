@@ -71,7 +71,7 @@ from modules.websearch import WebSearcher
 # Constants
 # ---------------------------------------------------------------------------
 RECOGNITION_INTERVAL = 15       # run face recognition every N frames
-VISION_INTERVAL      = 10.0    # seconds between automatic scene analyses
+VISION_INTERVAL      = 30.0    # seconds between automatic scene analyses
 IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
@@ -394,7 +394,12 @@ def conversation_loop(
 
         history = load_recent_messages(current_person_id, limit=10)
         try:
-            reply, emotion = convo.chat_with_emotion(user_input, history_override=history)
+            # Stream sentences to TTS as they arrive — first sentence plays while
+            # GPT is still generating the rest, cutting perceived latency.
+            for sentence in convo.stream_reply_sentences(user_input, history_override=history):
+                if speech:
+                    speech.speak(sentence)   # queued, not interrupt — preserves order
+                print(f"  ↳ {sentence}", flush=True)
         except Exception:
             logger.exception("GPT error")
             emotions.play(Emotion.ANGST)
@@ -404,11 +409,9 @@ def conversation_loop(
                 speech.speak(error_msg, interrupt=True)
             continue
 
-        # Start emotion animation and speech simultaneously
+        emotion = convo.last_emotion
+        reply   = convo.last_reply
         emotions.play(emotion)
-        if speech:
-            speech.speak(reply, interrupt=True)
-
         lang = detect_language(reply)
         print(f"Reachy [{emotion.value}][{lang}]: {reply}\n")
 
