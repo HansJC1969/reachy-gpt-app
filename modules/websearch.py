@@ -2,8 +2,8 @@
 Web search for Reachy — gives GPT-4o access to current information.
 
 Backend priority:
-  1. Tavily   (TAVILY_API_KEY set in .env)  — designed for AI agents, best quality
-  2. DuckDuckGo (ddgs package)              — free, no key needed
+  1. Tavily (TAVILY_API_KEY set in .env)  — PRIMARY; designed for AI agents
+  2. DuckDuckGo (ddgs package)            — fallback only if Tavily fails
 
 Query-aware Tavily settings:
   • Finance queries (bitcoin, price, stock…): topic="finance", time_range="day"
@@ -146,15 +146,12 @@ class WebSearcher:
                 return "tavily"
             except ImportError:
                 logger.warning("TAVILY_API_KEY set but tavily-python not installed")
-        # Try the new ddgs package first, then the old duckduckgo_search name
-        for mod in ("ddgs", "duckduckgo_search"):
-            try:
-                __import__(mod)
-                return "duckduckgo"
-            except ImportError:
-                continue
-        logger.warning("No DuckDuckGo package found — run: pip install ddgs")
-        return "none"
+        try:
+            import ddgs  # noqa: F401
+            return "duckduckgo"
+        except ImportError:
+            logger.warning("ddgs not installed — run: pip install ddgs")
+            return "none"
 
     # ── Tavily ────────────────────────────────────────────────────────────────
 
@@ -211,7 +208,6 @@ class WebSearcher:
         *,
         time_range: str | None,
     ) -> list[SearchResult]:
-        # Try the new "ddgs" package first; fall back to old "duckduckgo_search"
         DDGS = self._import_ddgs()
         if DDGS is None:
             logger.error("No DuckDuckGo package available")
@@ -246,14 +242,9 @@ class WebSearcher:
 
     @staticmethod
     def _import_ddgs():
-        """Return the DDGS class from whichever package is installed."""
+        """Return the DDGS class from the ddgs package, or None if not installed."""
         try:
-            from ddgs import DDGS  # type: ignore   # new package name
-            return DDGS
-        except ImportError:
-            pass
-        try:
-            from duckduckgo_search import DDGS  # type: ignore   # old package name
+            from ddgs import DDGS  # type: ignore
             return DDGS
         except ImportError:
             return None

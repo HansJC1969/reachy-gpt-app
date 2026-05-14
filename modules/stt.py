@@ -20,7 +20,10 @@ Both paths share _vad_loop():
   1. Discard frames until speech is detected (DoA flag or RMS > threshold).
   2. Record through trailing silence until SILENCE_DURATION seconds of
      quiet have elapsed.
-  3. Send WAV bytes to OpenAI Whisper-1, return the transcript.
+  3. Discard if speech content < MIN_SPEECH_DURATION (2 s) — prevents
+     noise bursts from being sent to Whisper and causing hallucinations.
+  4. Send WAV bytes to OpenAI Whisper-1 with language=WHISPER_LANGUAGE
+     ("de" by default) to prevent language-guessing misreads.
 
 Standalone test:
     python -m modules.stt
@@ -57,9 +60,15 @@ SPEECH_THRESHOLD = 0.02
 SILENCE_DURATION  = 1.5
 SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # ≈ 15
 
-# Discard recordings shorter than this (spurious noise triggers)
-MIN_SPEECH_DURATION = 0.4
-MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # ≈ 4
+# Minimum speech before transcription is attempted.
+# 2.0 s prevents short noise bursts (fans, clicks, ambient sound) from being
+# sent to Whisper, which causes hallucinations like "neun Kirchen" for noise.
+MIN_SPEECH_DURATION = 2.0
+MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 20
+
+# Whisper language hint — "de" stops Whisper toggling between German and
+# English phonemes, fixing misreadings of German proper nouns.
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "de")
 
 # Hard timeout waiting for speech
 MAX_DURATION = 30.0
@@ -243,8 +252,9 @@ class SpeechToText:
             rms = float(np.sqrt(np.mean(chunk ** 2)))
 
             if is_speech_fn is not None:
-                # SDK path: primary detector is hardware DSP; RMS guards noise floor
-                is_speech = is_speech_fn() and rms > (SPEECH_THRESHOLD * 0.5)
+                # SDK path: hardware DSP must flag speech AND audio must exceed
+                # 80% of the RMS threshold to suppress ambient background noise.
+                is_speech = is_speech_fn() and rms > (SPEECH_THRESHOLD * 0.8)
             else:
                 # Simulation path: energy RMS only
                 is_speech = rms >= SPEECH_THRESHOLD
@@ -300,6 +310,7 @@ class SpeechToText:
                 model="whisper-1",
                 file=("speech.wav", wav, "audio/wav"),
                 response_format="text",
+                language=WHISPER_LANGUAGE,
             )
             text = result.strip() if isinstance(result, str) else str(result).strip()
             logger.debug("STT transcript: %r", text[:120])
