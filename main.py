@@ -26,6 +26,7 @@ CLI flags:
 import argparse
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -281,6 +282,21 @@ def idle_loop(state: SharedState, emotions: EmotionEngine) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stop-command detection
+# ---------------------------------------------------------------------------
+
+_STOP_RE = re.compile(
+    r"\b(stop|stopp|halt|quiet|ruhig|schweig(?:en)?|aufhören|aufhör)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_stop_command(text: str) -> bool:
+    """Return True when the transcript is a stop/quiet command."""
+    return bool(_STOP_RE.search(text.strip()))
+
+
+# ---------------------------------------------------------------------------
 # Thread: conversation  stdin → GPT → stdout + emotion
 # ---------------------------------------------------------------------------
 
@@ -348,6 +364,16 @@ def conversation_loop(
 
         if not user_input:
             continue
+
+        # Stop command — interrupt TTS immediately and listen again
+        if _is_stop_command(user_input):
+            logger.info("Stop command: %r", user_input)
+            if speech:
+                speech.stop()
+                speech.speak("OK.", interrupt=True)
+            emotions.play(Emotion.NEUTRAL)
+            continue
+
         if user_input.lower() in {"quit", "exit", ":q", "tschüss", "auf wiedersehen"}:
             if speech:
                 speech.speak("Tschüss! Bis zum nächsten Mal.", interrupt=True)
