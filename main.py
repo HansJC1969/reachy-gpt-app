@@ -8,7 +8,7 @@ Threads:
   • recognition_loop  – identifies person every N frames
   • vision_loop       – GPT-4o scene description every VISION_INTERVAL seconds
   • idle_loop         – triggers MÜDE emotion when no face is seen for a while
-  • conversation_loop – stdin → GPT-4o (with web search + vision) → stdout
+  • conversation_loop – stdin → GPT-4o (with web search + vision) → stdout + TTS
 
 CLI flags:
   --no-robot          Run without a physical Reachy (simulation mode)
@@ -18,6 +18,8 @@ CLI flags:
   --emotion-test      Play each emotion in sequence and exit
   --no-vision         Disable automatic scene analysis
   --no-search         Disable web search
+  --no-speech         Disable text-to-speech output
+  --speech-sim        TTS synthesis but no audio playback (for testing)
 """
 
 import argparse
@@ -58,6 +60,7 @@ from modules.memory import (
     load_recent_messages,
     build_memory_context,
 )
+from modules.speech import SpeechEngine, detect_language, _sounddevice_available
 from modules.vision import VisionAnalyzer
 from modules.websearch import WebSearcher
 
@@ -235,6 +238,7 @@ def conversation_loop(
     state: SharedState,
     convo: ConversationManager,
     emotions: EmotionEngine,
+    speech: Optional[SpeechEngine] = None,
 ) -> None:
     logger.info("Conversation thread started — type to talk (Ctrl-C to quit)")
     current_person_id:   Optional[int] = None
@@ -253,9 +257,13 @@ def conversation_loop(
             logger.info("Context refreshed for '%s'", person_name)
             if current_person_id is not None:
                 emotions.play(Emotion.NEUGIER)
+                # Greet the newly recognised person aloud
+                greeting = f"Hallo{', ' + current_person_name if current_person_name != UNKNOWN_PERSON_NAME else ''}! Schön, dich zu sehen."
+                if speech:
+                    speech.speak(greeting, interrupt=True)
 
         try:
-            user_input = input(f"[{current_person_name}] You: ").strip()
+            user_input = input(f"[{current_person_name}] Du: ").strip()
         except EOFError:
             state.stop_event.set()
             break
@@ -265,9 +273,16 @@ def conversation_loop(
 
         if not user_input:
             continue
-        if user_input.lower() in {"quit", "exit", ":q"}:
+        if user_input.lower() in {"quit", "exit", ":q", "tschüss", "auf wiedersehen"}:
+            if speech:
+                speech.speak("Tschüss! Bis zum nächsten Mal.", interrupt=True)
+                speech.wait_until_done(timeout=5.0)
             state.stop_event.set()
             break
+
+        # Stop ongoing speech — user is already talking
+        if speech:
+            speech.stop()
 
         # Pass current frame so vision tool can use it
         with state.frame_lock:
@@ -282,11 +297,19 @@ def conversation_loop(
         except Exception:
             logger.exception("GPT error")
             emotions.play(Emotion.ANGST)
-            print("Reachy: [error — could not get a response]")
+            error_msg = "Entschuldigung, ich konnte leider keine Antwort bekommen."
+            print(f"Reachy: {error_msg}")
+            if speech:
+                speech.speak(error_msg, interrupt=True)
             continue
 
+        # Start emotion animation and speech simultaneously
         emotions.play(emotion)
-        print(f"Reachy [{emotion.value}]: {reply}\n")
+        if speech:
+            speech.speak(reply, interrupt=True)
+
+        lang = detect_language(reply)
+        print(f"Reachy [{emotion.value}][{lang}]: {reply}\n")
 
         save_message(current_person_id, "user", user_input)
         save_message(current_person_id, "assistant", reply)
@@ -336,6 +359,8 @@ def main() -> None:
     parser.add_argument("--camera",       type=int, default=CAMERA_INDEX)
     parser.add_argument("--no-vision",    action="store_true", help="Disable GPT-4o scene analysis")
     parser.add_argument("--no-search",    action="store_true", help="Disable web search")
+    parser.add_argument("--no-speech",    action="store_true", help="Disable text-to-speech output")
+    parser.add_argument("--speech-sim",   action="store_true", help="TTS synthesis without audio playback")
     args = parser.parse_args()
 
     # ---- one-shot commands -------------------------------------------------
@@ -385,6 +410,17 @@ def main() -> None:
         except Exception:
             logger.warning("Web search module disabled")
 
+    # Text-to-speech
+    speech: Optional[SpeechEngine] = None
+    if not args.no_speech:
+        sim_mode = args.speech_sim or not _sounddevice_available()
+        if sim_mode and not args.speech_sim:
+            logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
+        try:
+            speech = SpeechEngine(sim_mode=sim_mode)
+        except Exception:
+            logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
+
     tracker    = FaceTracker(reachy=reachy)
     recognizer = FaceRecognitionModule()
     emotions   = EmotionEngine(reachy=reachy)
@@ -393,7 +429,10 @@ def main() -> None:
     state = SharedState()
     state.current_person = UNKNOWN_PERSON_NAME
 
-    emotions.play(Emotion.FREUDE)   # startup greeting
+    # Startup: play FREUDE animation and speak a greeting simultaneously
+    emotions.play(Emotion.FREUDE)
+    if speech:
+        speech.speak("Hallo! Ich bin bereit. Wie kann ich dir helfen?")
 
     # Build thread list — vision_loop only started when vision module is active.
     # Use None as target sentinel; the loop below skips those entries.
@@ -403,7 +442,7 @@ def main() -> None:
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
         ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
         ("idle",         True,  idle_loop,                                  (state, emotions)),
-        ("conversation", False, conversation_loop,                          (state, convo, emotions)),
+        ("conversation", False, conversation_loop,                          (state, convo, emotions, speech)),
     ]
 
     threads = []
@@ -425,6 +464,8 @@ def main() -> None:
     finally:
         state.stop_event.set()
         emotions.stop()
+        if speech:
+            speech.shutdown()
         logger.info("Shutting down…")
         if reachy is not None:
             try:
