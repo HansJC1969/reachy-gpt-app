@@ -484,11 +484,16 @@ def main() -> None:
     # Text-to-speech
     speech: Optional[SpeechEngine] = None
     if not args.no_speech:
-        sim_mode = args.speech_sim or not sounddevice_available()
-        if sim_mode and not args.speech_sim:
-            logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
+        if reachy is not None:
+            # On-robot: SDK GStreamer backend owns the audio hardware.
+            # sounddevice cannot reach the speaker; use push_audio_sample instead.
+            sim_mode = args.speech_sim
+        else:
+            sim_mode = args.speech_sim or not sounddevice_available()
+            if sim_mode and not args.speech_sim:
+                logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
         try:
-            speech = SpeechEngine(sim_mode=sim_mode)
+            speech = SpeechEngine(sim_mode=sim_mode, reachy=reachy)
         except Exception:
             logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
 
