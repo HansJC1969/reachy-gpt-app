@@ -33,6 +33,7 @@ import time
 from typing import Optional
 
 import cv2
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
