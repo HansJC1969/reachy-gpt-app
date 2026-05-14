@@ -1,15 +1,22 @@
 """
 OpenAI GPT-4o conversation manager.
 Maintains session history, injects memory context, and streams replies.
-Can be used independently: python -m modules.conversation
+GPT also tags its own emotional state via function calling — the caller
+receives both the text reply and an Emotion value in one API round-trip.
+
+Standalone test:
+    python -m modules.conversation
 """
 
+import json
 import os
 import logging
 from typing import Optional, Generator
 
 import openai
 from dotenv import load_dotenv
+
+from modules.emotions import Emotion, parse_emotion
 
 load_dotenv()
 
@@ -19,7 +26,34 @@ BASE_SYSTEM_PROMPT = """You are Reachy, a friendly and curious social robot made
 You are having a face-to-face conversation with a person standing in front of you.
 Keep responses conversational and concise (1-3 sentences unless asked for detail).
 You have a memory of past interactions and will use it to personalise the conversation.
-Never break character. If you don't know something, say so honestly."""
+Never break character. If you don't know something, say so honestly.
+
+After every reply you MUST call the `express_emotion` function to signal how you feel.
+Pick the emotion that best matches your current response:
+  neutral, freude, trauer, angst, müde, nachdenken, tanzen, ueberraschung, neugier"""
+
+# OpenAI function spec — GPT uses this to tag its own emotion
+_EMOTION_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "express_emotion",
+        "description": (
+            "Signal the robot's emotional state so it can move accordingly. "
+            "Call this after every reply."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "emotion": {
+                    "type": "string",
+                    "enum": [e.value for e in Emotion],
+                    "description": "The emotion Reachy should express.",
+                }
+            },
+            "required": ["emotion"],
+        },
+    },
+}
 
 
 class ConversationManager:
@@ -38,21 +72,33 @@ class ConversationManager:
     # ------------------------------------------------------------------
 
     def set_person(self, name: str, memory_context: str) -> None:
-        """
-        Switch the active person.  Clears session history and injects
-        memory context into the system prompt.
-        """
+        """Switch the active person, clear session history, inject memory."""
         if self._current_person != name:
             logger.info("Switching conversation context to: %s", name)
             self._session_history.clear()
         self._current_person = name
         self._memory_context = memory_context
 
-    def chat(self, user_input: str, history_override: Optional[list[dict]] = None) -> str:
+    def chat(
+        self,
+        user_input: str,
+        history_override: Optional[list[dict]] = None,
+    ) -> str:
+        """Return the assistant reply (emotion is ignored)."""
+        reply, _ = self.chat_with_emotion(user_input, history_override)
+        return reply
+
+    def chat_with_emotion(
+        self,
+        user_input: str,
+        history_override: Optional[list[dict]] = None,
+    ) -> tuple[str, Emotion]:
         """
-        Send *user_input* to GPT-4o and return the assistant reply.
-        Appends both turns to session history.
-        *history_override* lets callers supply their own history (e.g. loaded from DB).
+        Send *user_input* to GPT-4o.
+        Returns (reply_text, Emotion).
+
+        GPT signals its emotion via the `express_emotion` tool call embedded
+        in the same API response — no extra round-trip required.
         """
         messages = self._build_messages(user_input, history_override)
         logger.debug("Sending %d messages to %s", len(messages), self.model)
@@ -60,20 +106,53 @@ class ConversationManager:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            max_tokens=256,
+            tools=[_EMOTION_TOOL],
+            tool_choice="auto",
+            max_tokens=300,
             temperature=0.8,
         )
-        reply = response.choices[0].message.content.strip()
+
+        msg = response.choices[0].message
+        reply = (msg.content or "").strip()
+        emotion = Emotion.NEUTRAL
+
+        # Parse emotion from tool call if GPT included one
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc.function.name == "express_emotion":
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        emotion = parse_emotion(args.get("emotion", "neutral"))
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+        # If GPT returned only a tool call and no text content, ask for a
+        # follow-up message (can happen when tool_choice forces it)
+        if not reply and msg.tool_calls:
+            follow = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    *messages,
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        tc.model_dump() for tc in msg.tool_calls
+                    ]},
+                    {"role": "tool", "tool_call_id": msg.tool_calls[0].id, "content": "ok"},
+                ],
+                max_tokens=256,
+                temperature=0.8,
+            )
+            reply = (follow.choices[0].message.content or "").strip()
 
         self._session_history.append({"role": "user", "content": user_input})
         self._session_history.append({"role": "assistant", "content": reply})
 
-        return reply
+        logger.debug("Reply: %r  |  emotion: %s", reply[:60], emotion.value)
+        return reply, emotion
 
-    def stream_chat(self, user_input: str) -> Generator[str, None, str]:
+    def stream_chat(self, user_input: str) -> Generator[str, None, None]:
         """
-        Streaming variant. Yields text chunks as they arrive.
-        Returns the full assembled reply.
+        Streaming text-only variant (emotion not extracted).
+        Yields text chunks; full reply is appended to session history when done.
         """
         messages = self._build_messages(user_input)
         full_reply: list[str] = []
@@ -91,7 +170,6 @@ class ConversationManager:
         reply = "".join(full_reply)
         self._session_history.append({"role": "user", "content": user_input})
         self._session_history.append({"role": "assistant", "content": reply})
-        return reply
 
     def clear_session(self) -> None:
         self._session_history.clear()
@@ -129,8 +207,6 @@ class ConversationManager:
 # Standalone test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys
-
     logging.basicConfig(level=logging.INFO)
     mgr = ConversationManager()
     mgr.set_person("Tester", "")
@@ -142,5 +218,5 @@ if __name__ == "__main__":
             break
         if user.lower() in {"quit", "exit"}:
             break
-        reply = mgr.chat(user)
-        print(f"Reachy: {reply}\n")
+        reply, emotion = mgr.chat_with_emotion(user)
+        print(f"Reachy [{emotion.value}]: {reply}\n")

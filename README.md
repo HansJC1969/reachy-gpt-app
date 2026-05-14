@@ -78,6 +78,7 @@ python main.py
 | `--setup` | Initialise the SQLite database and exit |
 | `--add-person "Name"` | Register a new person's face via camera |
 | `--camera INDEX` | Camera device index (default: `CAMERA_INDEX` env var or `0`) |
+| `--emotion-test` | Play all emotion animations in sequence and exit |
 
 ---
 
@@ -98,13 +99,27 @@ The robot will automatically:
 - Recognise you after the first few frames
 - Load your conversation history from the database
 - Generate a summary every 50 messages to maintain long-term context
+- Express emotions through neck movements and antenna positions
+
+### Emotions expressed
+
+| Emotion | Trigger | Movement |
+|---|---|---|
+| Freude | Happy / excited reply | Head bobs, antennas spring up and wiggle |
+| Trauer | Sad topic | Head droops slowly, antennas hang down |
+| Angst | Scary / uncertain topic | Head trembles left/right, antennas press down |
+| Müde | No face seen for 12 s | Head nods off slowly with a small jerk-awake |
+| Nachdenken | Shown while GPT thinks | Head tilts, one antenna raised |
+| Tanzen | Asked to dance or playful reply | Rhythmic head sways, alternating antennas |
+| Überraschung | Surprising content | Head snaps back, both antennas shoot up |
+| Neugier | New person appears / curious reply | Head leans forward+sideways, antennas perked |
 
 ---
 
 ## Testing modules independently
 
 ```bash
-# GPT chat only (no camera, no robot)
+# GPT chat only (no camera, no robot) — shows emotion tag per reply
 python -m modules.conversation
 
 # Face tracking visualiser (webcam required)
@@ -115,6 +130,15 @@ python -m modules.face_recognition_module --identify
 
 # List known people in the encodings file
 python -m modules.face_recognition_module
+
+# Emotion animation demo — all emotions, no robot
+python -m modules.emotions --demo
+
+# Single emotion demo
+python -m modules.emotions --demo --emotion tanzen
+
+# All emotions on real robot
+python main.py --emotion-test
 ```
 
 ---

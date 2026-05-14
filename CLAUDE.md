@@ -16,7 +16,8 @@ reachy-gpt-app/
 ├── main.py                          # Entry point; orchestrates all threads
 ├── modules/
 │   ├── __init__.py
-│   ├── conversation.py              # GPT-4o chat manager
+│   ├── conversation.py              # GPT-4o chat manager + emotion extraction
+│   ├── emotions.py                  # Keyframe animations: neck + antennas
 │   ├── face_tracking.py             # OpenCV Haar cascade + neck control
 │   ├── face_recognition_module.py   # face_recognition lib + pickle storage
 │   └── memory.py                    # SQLite: persons / conversations / summaries
@@ -43,11 +44,74 @@ reachy-gpt-app/
 camera_loop        (daemon)  → captures frames at ~30 fps
 tracking_loop      (daemon)  → moves neck at 20 Hz using latest face position
 recognition_loop   (daemon)  → identifies person every 15 frames
-conversation_loop  (main)    → stdin → GPT-4o → stdout + DB persistence
+idle_loop          (daemon)  → plays MÜDE after 12 s without a detected face
+conversation_loop  (main)    → stdin → GPT-4o → stdout + DB persistence + emotion
 ```
 
 All threads share `SharedState` which uses `threading.Lock` for safe access.
 `stop_event` (a `threading.Event`) signals all threads to exit cleanly.
+
+## Emotion system (`modules/emotions.py`)
+
+### Supported emotions
+
+| Enum value | German | Bewegung |
+|---|---|---|
+| `NEUTRAL` | Neutral | Kopf zentriert, Antennen waagerecht |
+| `FREUDE` | Freude | Schnelle Kopfbewegungen auf/ab, Antennen federn hoch und wackeln |
+| `TRAUER` | Trauer | Kopf sinkt langsam vorwärts, Antennen hängen nach unten |
+| `ANGST` | Angst | Kopf zittert links/rechts schnell, Antennen gedrückt nach unten |
+| `MÜDE` | Müde | Sehr langsames Abnicken, kurzes Aufschrecken mid-Animation |
+| `NACHDENKEN` | Nachdenken | Kopf kippt rechts + oben, linke Antenne hoch, kleine Schwingungen |
+| `TANZEN` | Tanzen | Rhythmischer Links-Rechts-Schwung (4×), Antennen gegenläufig |
+| `ÜBERRASCHUNG` | Überraschung | Schneller Ruck nach hinten, beide Antennen schnellen hoch |
+| `NEUGIER` | Neugier | Kopf neigt sich vor und zur Seite, Antennen gleichmäßig hochgerichtet |
+
+### Hardware interface
+- `reachy.head.neck.pitch` — Kopfneigung (positiv = oben)
+- `reachy.head.neck.yaw`   — Kopfdrehung (positiv = rechts)
+- `reachy.head.neck.roll`  — Kopfkippen  (positiv = rechts) — optional, wird ignoriert wenn nicht verfügbar
+- `reachy.head.l_antenna.goal_position` — linke Antenne (°)
+- `reachy.head.r_antenna.goal_position` — rechte Antenne (°)
+
+### Key classes
+
+```python
+EmotionEngine(reachy=None)          # None → simulation mode
+engine.play(Emotion.FREUDE)         # non-blocking
+engine.play(Emotion.TANZEN, block=True)  # blocking
+engine.stop()                       # sofort stoppen + neutral
+engine.idle()                       # sanft zu neutral
+
+parse_emotion("freude") → Emotion.FREUDE   # string → Enum
+```
+
+### Keyframe format
+
+```python
+Keyframe(t=0.5, pitch=10, yaw=5, roll=3, l_ant=45, r_ant=40)
+# t     = Zeit in Sekunden ab Animationsstart
+# pitch = Neigung °  (±20 typisch)
+# yaw   = Drehung °  (±30 typisch)
+# roll  = Kippen °   (±15 typisch)
+# l_ant = linke  Antenne ° (-45 unten … +65 hoch)
+# r_ant = rechte Antenne ° (-45 unten … +65 hoch)
+```
+
+Interpolation erfolgt mit Cosinus-Glättung zwischen Keyframes.
+
+### Emotion detection (GPT function calling)
+
+`ConversationManager.chat_with_emotion()` nutzt einen OpenAI Function-Call
+`express_emotion(emotion: str)` im selben API-Request — keine zweite
+Anfrage nötig. Falls GPT keine Emotion mitschickt, wird `NEUTRAL` zurückgegeben.
+
+### CLI flag
+```bash
+python main.py --emotion-test      # alle Animationen nacheinander abspielen
+python -m modules.emotions --demo  # dasselbe ohne Roboter
+python -m modules.emotions --demo --emotion tanzen  # einzelne Emotion
+```
 
 ## Module contracts
 
