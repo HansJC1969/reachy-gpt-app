@@ -16,11 +16,13 @@ reachy-gpt-app/
 ├── main.py                          # Entry point; orchestrates all threads
 ├── modules/
 │   ├── __init__.py
-│   ├── conversation.py              # GPT-4o chat manager + emotion extraction
+│   ├── conversation.py              # GPT-4o chat + tool-execution loop
 │   ├── emotions.py                  # Keyframe animations: neck + antennas
 │   ├── face_tracking.py             # OpenCV Haar cascade + neck control
 │   ├── face_recognition_module.py   # face_recognition lib + pickle storage
-│   └── memory.py                    # SQLite: persons / conversations / summaries
+│   ├── memory.py                    # SQLite: persons / conversations / summaries
+│   ├── vision.py                    # GPT-4o vision: scene description
+│   └── websearch.py                 # Web search: Tavily (primary) / DuckDuckGo
 ├── requirements.txt
 ├── .env.template                    # Copy → .env and fill values
 ├── CLAUDE.md                        # This file
@@ -44,8 +46,9 @@ reachy-gpt-app/
 camera_loop        (daemon)  → captures frames at ~30 fps
 tracking_loop      (daemon)  → moves neck at 20 Hz using latest face position
 recognition_loop   (daemon)  → identifies person every 15 frames
+vision_loop        (daemon)  → GPT-4o scene description every VISION_INTERVAL s
 idle_loop          (daemon)  → plays MÜDE after 12 s without a detected face
-conversation_loop  (main)    → stdin → GPT-4o → stdout + DB persistence + emotion
+conversation_loop  (main)    → stdin → GPT-4o (tools) → stdout + emotion
 ```
 
 All threads share `SharedState` which uses `threading.Lock` for safe access.
@@ -112,6 +115,71 @@ python main.py --emotion-test      # alle Animationen nacheinander abspielen
 python -m modules.emotions --demo  # dasselbe ohne Roboter
 python -m modules.emotions --demo --emotion tanzen  # einzelne Emotion
 ```
+
+## Web search (`modules/websearch.py`)
+
+```python
+searcher = WebSearcher()           # auto-detects Tavily or DuckDuckGo
+results  = searcher.search("query", max_results=5)   # → list[SearchResult]
+text     = searcher.format_results(results)           # numbered markdown
+text     = searcher.search_and_format("query")        # convenience one-liner
+searcher.backend                   # "tavily" | "duckduckgo" | "none"
+```
+
+Backend selection (in order of preference):
+1. **Tavily** — set `TAVILY_API_KEY` in `.env` and `pip install tavily-python`
+2. **DuckDuckGo** — `pip install duckduckgo-search` (no key required)
+
+GPT decides autonomously when to call web search based on the question.
+Triggers: current events, weather, prices, facts that may have changed.
+
+```bash
+python -m modules.websearch "Was ist die Hauptstadt von Japan?"
+```
+
+## Vision / scene recognition (`modules/vision.py`)
+
+```python
+vision = VisionAnalyzer(interval=10.0)
+desc   = vision.analyze(frame)                       # one-shot description
+desc   = vision.analyze_periodic(frame)              # only if interval elapsed
+desc   = vision.analyze_on_command(frame, question)  # answer specific question
+vision.last_description                              # cached last result
+vision.reset_timer()                                 # force next periodic run
+```
+
+Two integration points:
+1. **Passive** — `vision_loop` thread calls `analyze_periodic()` every 10 s.
+   The description is injected into the system prompt so Reachy always has
+   background scene awareness.
+2. **Active** — GPT calls the `get_visual_description` tool when the user asks
+   "was siehst du?" or when visual context would improve the answer.
+
+```bash
+python -m modules.vision --camera 0 --interval 10
+```
+
+## GPT tool execution flow (`modules/conversation.py`)
+
+GPT-4o has access to three tools per reply:
+
+| Tool | Trigger | Execution |
+|---|---|---|
+| `express_emotion` | every reply | captures emotion, returns "ok" |
+| `web_search` | current facts needed | calls `WebSearcher.search_and_format()` |
+| `get_visual_description` | visual question | calls `VisionAnalyzer.analyze_on_command()` |
+
+The `chat_with_emotion()` method runs a tool loop (max 5 rounds):
+```
+GPT response
+  └─ tool_calls?
+      ├─ execute search / vision → append result → next GPT call
+      ├─ execute express_emotion → capture emotion → continue
+      └─ finish_reason == "stop" → return (reply, emotion)
+```
+
+`convo.set_latest_frame(frame)` must be called before `chat_with_emotion()`
+so the vision tool has a fresh frame available.
 
 ## Module contracts
 
@@ -188,6 +256,19 @@ long-term context without exceeding the context window.
 match (lower = stricter).  Default `0.5` works well in normal lighting.
 Reduce to `0.4` to avoid false positives; increase to `0.6` if known people
 are being rejected.
+
+## CLI flags
+
+```
+python main.py                         # Full run (requires REACHY_IP)
+python main.py --no-robot              # Simulated robot
+python main.py --no-vision             # Disable GPT-4o scene analysis
+python main.py --no-search             # Disable web search
+python main.py --setup                 # Init DB only
+python main.py --add-person "Alice"    # Register Alice's face
+python main.py --camera 1              # Use camera device 1
+python main.py --emotion-test          # Demo all emotion animations
+```
 
 ## Robot SDK notes
 

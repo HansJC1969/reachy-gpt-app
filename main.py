@@ -3,11 +3,12 @@
 Reachy GPT App — main entry point.
 
 Threads:
-  • camera_loop       – captures frames, runs Haar face detection
+  • camera_loop       – captures frames, runs Haar face detection (~30 fps)
   • tracking_loop     – moves neck/body to follow face (20 Hz)
   • recognition_loop  – identifies person every N frames
+  • vision_loop       – GPT-4o scene description every VISION_INTERVAL seconds
   • idle_loop         – triggers MÜDE emotion when no face is seen for a while
-  • conversation_loop – text I/O: stdin → GPT-4o → stdout + emotion animation
+  • conversation_loop – stdin → GPT-4o (with web search + vision) → stdout
 
 CLI flags:
   --no-robot          Run without a physical Reachy (simulation mode)
@@ -15,6 +16,8 @@ CLI flags:
   --add-person "Name" Register a new face and exit
   --camera INDEX      Camera device index (default: $CAMERA_INDEX or 0)
   --emotion-test      Play each emotion in sequence and exit
+  --no-vision         Disable automatic scene analysis
+  --no-search         Disable web search
 """
 
 import argparse
@@ -55,14 +58,17 @@ from modules.memory import (
     load_recent_messages,
     build_memory_context,
 )
+from modules.vision import VisionAnalyzer
+from modules.websearch import WebSearcher
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 RECOGNITION_INTERVAL = 15       # run face recognition every N frames
-IDLE_TIMEOUT = 12.0             # seconds without a face before MÜDE animation
-CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-UNKNOWN_PERSON_NAME = "Stranger"
+VISION_INTERVAL      = 10.0    # seconds between automatic scene analyses
+IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
+CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
+UNKNOWN_PERSON_NAME  = "Stranger"
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +78,17 @@ UNKNOWN_PERSON_NAME = "Stranger"
 class SharedState:
     def __init__(self) -> None:
         self.latest_frame: Optional[cv2.Mat] = None
-        self.latest_face: Optional[FacePosition] = None
+        self.latest_face:  Optional[FacePosition] = None
         self.current_person: Optional[str] = None
         self.last_face_seen: float = time.monotonic()
 
-        self.frame_lock  = threading.Lock()
-        self.face_lock   = threading.Lock()
-        self.person_lock = threading.Lock()
-        self.stop_event  = threading.Event()
+        # Most recent automatic scene description (set by vision_loop)
+        self.latest_scene: Optional[str] = None
+
+        self.frame_lock   = threading.Lock()
+        self.face_lock    = threading.Lock()
+        self.person_lock  = threading.Lock()
+        self.stop_event   = threading.Event()
 
         self.conversation_queue: queue.Queue = queue.Queue()
 
@@ -119,7 +128,7 @@ def camera_loop(state: SharedState, tracker: FaceTracker, camera_idx: int) -> No
 
 
 # ---------------------------------------------------------------------------
-# Thread: face tracking (neck / body movement)
+# Thread: face tracking
 # ---------------------------------------------------------------------------
 
 def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
@@ -127,14 +136,11 @@ def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
     while not state.stop_event.is_set():
         with state.face_lock:
             face = state.latest_face
-
         if face is not None:
             tracker.update(face)
         else:
             tracker.center_head()
-
         time.sleep(0.05)    # 20 Hz
-
     logger.info("Tracking thread stopped")
 
 
@@ -145,7 +151,6 @@ def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
 def recognition_loop(state: SharedState, recognizer: FaceRecognitionModule) -> None:
     logger.info("Recognition thread started")
     frame_count = 0
-
     while not state.stop_event.is_set():
         time.sleep(0.1)
         frame_count += 1
@@ -173,28 +178,52 @@ def recognition_loop(state: SharedState, recognizer: FaceRecognitionModule) -> N
 
 
 # ---------------------------------------------------------------------------
-# Thread: idle emotion — triggers MÜDE when nobody is around
+# Thread: GPT-4o vision — automatic scene description
+# ---------------------------------------------------------------------------
+
+def vision_loop(state: SharedState, vision: VisionAnalyzer) -> None:
+    """
+    Every VISION_INTERVAL seconds: grab the latest frame, send it to
+    GPT-4o vision, and store the description in state.latest_scene.
+    The conversation_loop injects this description into the system prompt
+    so Reachy has passive scene awareness at all times.
+    """
+    logger.info("Vision thread started (interval=%.0fs)", VISION_INTERVAL)
+    while not state.stop_event.is_set():
+        time.sleep(1.0)     # check every second; VisionAnalyzer controls actual interval
+
+        with state.frame_lock:
+            frame = state.latest_frame
+        if frame is None:
+            continue
+
+        desc = vision.analyze_periodic(frame)
+        if desc:
+            state.latest_scene = desc
+            logger.info("Scene: %s", desc[:80])
+
+    logger.info("Vision thread stopped")
+
+
+# ---------------------------------------------------------------------------
+# Thread: idle emotion
 # ---------------------------------------------------------------------------
 
 def idle_loop(state: SharedState, emotions: EmotionEngine) -> None:
     logger.info("Idle loop started")
     was_idle = False
-
     while not state.stop_event.is_set():
         time.sleep(1.0)
-        idle_seconds = time.monotonic() - state.last_face_seen
-
-        if idle_seconds > IDLE_TIMEOUT:
+        idle_sec = time.monotonic() - state.last_face_seen
+        if idle_sec > IDLE_TIMEOUT:
             if not was_idle:
-                logger.info("No face for %.0fs — expressing MÜDE", idle_seconds)
+                logger.info("No face for %.0fs — expressing MÜDE", idle_sec)
                 emotions.play(Emotion.MÜDE)
                 was_idle = True
         else:
             if was_idle:
-                # Face reappeared
                 emotions.play(Emotion.NEUGIER)
                 was_idle = False
-
     logger.info("Idle loop stopped")
 
 
@@ -208,7 +237,7 @@ def conversation_loop(
     emotions: EmotionEngine,
 ) -> None:
     logger.info("Conversation thread started — type to talk (Ctrl-C to quit)")
-    current_person_id: Optional[int] = None
+    current_person_id:   Optional[int] = None
     current_person_name: Optional[str] = None
 
     while not state.stop_event.is_set():
@@ -221,8 +250,7 @@ def conversation_loop(
             current_person_id = get_or_create_person(person_name)
             memory_ctx = build_memory_context(current_person_id)
             convo.set_person(person_name, memory_ctx)
-            logger.info("Conversation context refreshed for '%s'", person_name)
-            # Greet with curiosity if it's not the first load
+            logger.info("Context refreshed for '%s'", person_name)
             if current_person_id is not None:
                 emotions.play(Emotion.NEUGIER)
 
@@ -237,12 +265,15 @@ def conversation_loop(
 
         if not user_input:
             continue
-
         if user_input.lower() in {"quit", "exit", ":q"}:
             state.stop_event.set()
             break
 
-        # Show "thinking" immediately while waiting for GPT
+        # Pass current frame so vision tool can use it
+        with state.frame_lock:
+            convo.set_latest_frame(state.latest_frame)
+
+        # Show "thinking" while waiting for GPT
         emotions.play(Emotion.NACHDENKEN)
 
         history = load_recent_messages(current_person_id, limit=10)
@@ -254,7 +285,6 @@ def conversation_loop(
             print("Reachy: [error — could not get a response]")
             continue
 
-        # Express the emotion GPT chose
         emotions.play(emotion)
         print(f"Reachy [{emotion.value}]: {reply}\n")
 
@@ -284,7 +314,6 @@ def build_reachy(ip: str):
 
 
 def run_emotion_test(reachy) -> None:
-    """Play every emotion in sequence and exit."""
     engine = EmotionEngine(reachy=reachy)
     print("Emotion test — playing all animations:\n")
     for emo in Emotion:
@@ -300,11 +329,13 @@ def run_emotion_test(reachy) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reachy GPT conversational robot")
-    parser.add_argument("--no-robot",     action="store_true", help="Run without physical Reachy")
-    parser.add_argument("--setup",        action="store_true", help="Initialise database and exit")
-    parser.add_argument("--add-person",   metavar="NAME",      help="Register a new face and exit")
-    parser.add_argument("--emotion-test", action="store_true", help="Play all emotions and exit")
+    parser.add_argument("--no-robot",     action="store_true")
+    parser.add_argument("--setup",        action="store_true")
+    parser.add_argument("--add-person",   metavar="NAME")
+    parser.add_argument("--emotion-test", action="store_true")
     parser.add_argument("--camera",       type=int, default=CAMERA_INDEX)
+    parser.add_argument("--no-vision",    action="store_true", help="Disable GPT-4o scene analysis")
+    parser.add_argument("--no-search",    action="store_true", help="Disable web search")
     args = parser.parse_args()
 
     # ---- one-shot commands -------------------------------------------------
@@ -333,52 +364,61 @@ def main() -> None:
     # ---- normal run --------------------------------------------------------
     init_db()
 
+    # Optional modules
+    vision: Optional[VisionAnalyzer] = None
+    if not args.no_vision:
+        try:
+            vision = VisionAnalyzer(interval=VISION_INTERVAL)
+            logger.info("Vision module enabled (interval=%.0fs)", VISION_INTERVAL)
+        except Exception:
+            logger.warning("Vision module disabled (check OPENAI_API_KEY)")
+
+    searcher: Optional[WebSearcher] = None
+    if not args.no_search:
+        try:
+            s = WebSearcher()
+            if s.backend != "none":
+                searcher = s
+                logger.info("Web search enabled (backend=%s)", s.backend)
+            else:
+                logger.warning("No search backend available — install duckduckgo-search or set TAVILY_API_KEY")
+        except Exception:
+            logger.warning("Web search module disabled")
+
     tracker    = FaceTracker(reachy=reachy)
     recognizer = FaceRecognitionModule()
-    convo      = ConversationManager()
     emotions   = EmotionEngine(reachy=reachy)
+    convo      = ConversationManager(vision=vision, searcher=searcher)
 
     state = SharedState()
     state.current_person = UNKNOWN_PERSON_NAME
 
-    # Startup greeting
-    emotions.play(Emotion.FREUDE)
+    emotions.play(Emotion.FREUDE)   # startup greeting
 
-    threads = [
-        threading.Thread(
-            target=camera_loop,
-            args=(state, tracker, args.camera),
-            name="camera", daemon=True,
-        ),
-        threading.Thread(
-            target=tracking_loop,
-            args=(state, tracker),
-            name="tracking", daemon=True,
-        ),
-        threading.Thread(
-            target=recognition_loop,
-            args=(state, recognizer),
-            name="recognition", daemon=True,
-        ),
-        threading.Thread(
-            target=idle_loop,
-            args=(state, emotions),
-            name="idle", daemon=True,
-        ),
-        # conversation is non-daemon: controls app lifetime
-        threading.Thread(
-            target=conversation_loop,
-            args=(state, convo, emotions),
-            name="conversation", daemon=False,
-        ),
+    # Build thread list — vision_loop only when vision module is active
+    thread_specs = [
+        ("camera",       True,  camera_loop,       (state, tracker, args.camera)),
+        ("tracking",     True,  tracking_loop,      (state, tracker)),
+        ("recognition",  True,  recognition_loop,   (state, recognizer)),
+        ("vision",       vision is not None, vision_loop, (state, vision)),
+        ("idle",         True,  idle_loop,          (state, emotions)),
+        ("conversation", False, conversation_loop,  (state, convo, emotions)),
     ]
 
-    logger.info("Starting all threads…")
+    threads = []
+    for name, is_daemon, target, t_args in thread_specs:
+        if target is None:
+            continue
+        t = threading.Thread(target=target, args=t_args, name=name, daemon=is_daemon)
+        threads.append(t)
+
+    logger.info("Starting %d threads…", len(threads))
     for t in threads:
         t.start()
 
     try:
-        threads[-1].join()      # wait for conversation thread
+        # Wait for the conversation thread (the only non-daemon thread)
+        next(t for t in threads if t.name == "conversation").join()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
