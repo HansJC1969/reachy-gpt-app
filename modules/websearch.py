@@ -13,8 +13,7 @@ Query-aware Tavily settings:
 
 If Tavily fails at runtime the call falls through to DuckDuckGo automatically.
 
-DuckDuckGo uses backend="html" (avoids Bing rate limits).  "ddgs" package is
-preferred over the old "duckduckgo_search" package; both are tried.
+DuckDuckGo uses backend="html" (avoids Bing rate limits) via the "ddgs" package.
 
 Standalone test:
     python -m modules.websearch "Bitcoin price today"
