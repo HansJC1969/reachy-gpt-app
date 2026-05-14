@@ -12,7 +12,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np

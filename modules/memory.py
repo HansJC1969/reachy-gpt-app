@@ -6,7 +6,6 @@ Can be imported and used independently of the robot.
 import sqlite3
 import os
 import logging
-from datetime import datetime
 from typing import Optional
 
 import openai
@@ -21,8 +20,9 @@ SUMMARY_THRESHOLD = 50  # auto-summarize after this many messages per person
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # concurrent read-write safety
     return conn
 
 
@@ -145,7 +145,10 @@ def _maybe_summarize(person_id: int) -> None:
         return
 
     logger.info("Auto-summarizing %d messages for person_id=%d", unsummarized, person_id)
-    _create_summary(person_id, total)
+    try:
+        _create_summary(person_id, total)
+    except Exception:
+        logger.exception("Auto-summarization failed for person_id=%d — continuing without summary", person_id)
 
 
 def _create_summary(person_id: int, up_to_msg: int) -> None:
@@ -159,7 +162,11 @@ def _create_summary(person_id: int, up_to_msg: int) -> None:
     messages = [{"role": r["role"], "content": r["content"]} for r in rows]
     transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
 
-    client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("OPENAI_API_KEY not set — cannot create summary")
+
+    client = openai.OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[

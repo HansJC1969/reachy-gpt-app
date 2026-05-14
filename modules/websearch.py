@@ -108,7 +108,7 @@ class WebSearcher:
 
     def _search_tavily(self, query: str, max_results: int) -> list[SearchResult]:
         from tavily import TavilyClient  # type: ignore
-        client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+        client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY", ""))
         resp = client.search(
             query=query,
             max_results=max_results,

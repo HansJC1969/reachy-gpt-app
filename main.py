@@ -395,14 +395,15 @@ def main() -> None:
 
     emotions.play(Emotion.FREUDE)   # startup greeting
 
-    # Build thread list — vision_loop only when vision module is active
+    # Build thread list — vision_loop only started when vision module is active.
+    # Use None as target sentinel; the loop below skips those entries.
     thread_specs = [
-        ("camera",       True,  camera_loop,       (state, tracker, args.camera)),
-        ("tracking",     True,  tracking_loop,      (state, tracker)),
-        ("recognition",  True,  recognition_loop,   (state, recognizer)),
-        ("vision",       vision is not None, vision_loop, (state, vision)),
-        ("idle",         True,  idle_loop,          (state, emotions)),
-        ("conversation", False, conversation_loop,  (state, convo, emotions)),
+        ("camera",       True,  camera_loop,                               (state, tracker, args.camera)),
+        ("tracking",     True,  tracking_loop,                              (state, tracker)),
+        ("recognition",  True,  recognition_loop,                           (state, recognizer)),
+        ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
+        ("idle",         True,  idle_loop,                                  (state, emotions)),
+        ("conversation", False, conversation_loop,                          (state, convo, emotions)),
     ]
 
     threads = []
@@ -429,7 +430,7 @@ def main() -> None:
             try:
                 tracker.center_head()
             except Exception:
-                pass
+                logger.warning("Could not centre head on shutdown", exc_info=True)
 
 
 if __name__ == "__main__":

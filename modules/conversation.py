@@ -224,34 +224,39 @@ class ConversationManager:
                 except json.JSONDecodeError:
                     args = {}
 
-                if fn == "express_emotion":
-                    emotion = parse_emotion(args.get("emotion", "neutral"))
-                    result = "ok"
+                try:
+                    if fn == "express_emotion":
+                        emotion = parse_emotion(args.get("emotion", "neutral"))
+                        result = "ok"
 
-                elif fn == "web_search":
-                    has_real_tool = True
-                    query = args.get("query", "")
-                    logger.info("Tool: web_search(%r)", query)
-                    if self._searcher:
-                        result = self._searcher.search_and_format(query)
+                    elif fn == "web_search":
+                        has_real_tool = True
+                        query = args.get("query", "")
+                        logger.info("Tool: web_search(%r)", query)
+                        if self._searcher:
+                            result = self._searcher.search_and_format(query)
+                        else:
+                            result = "Web search is not available."
+
+                    elif fn == "get_visual_description":
+                        has_real_tool = True
+                        question = args.get("question", "")
+                        logger.info("Tool: get_visual_description(%r)", question)
+                        if self._vision and self._latest_frame is not None:
+                            result = self._vision.analyze_on_command(
+                                self._latest_frame, question or "What do you see?"
+                            )
+                        elif self._vision and self._latest_frame is None:
+                            result = "No camera frame available right now."
+                        else:
+                            result = "Visual analysis is not available."
+
                     else:
-                        result = "Web search is not available."
+                        result = f"Unknown tool: {fn}"
 
-                elif fn == "get_visual_description":
-                    has_real_tool = True
-                    question = args.get("question", "")
-                    logger.info("Tool: get_visual_description(%r)", question)
-                    if self._vision and self._latest_frame is not None:
-                        result = self._vision.analyze_on_command(
-                            self._latest_frame, question or "What do you see?"
-                        )
-                    elif self._vision and self._latest_frame is None:
-                        result = "No camera frame available right now."
-                    else:
-                        result = "Visual analysis is not available."
-
-                else:
-                    result = f"Unknown tool: {fn}"
+                except Exception:
+                    logger.exception("Tool execution failed for '%s'", fn)
+                    result = f"Tool '{fn}' encountered an error."
 
                 tool_results.append({
                     "role": "tool",
@@ -259,8 +264,22 @@ class ConversationManager:
                     "content": result,
                 })
 
-            # Append assistant turn + tool results for next round
-            messages.append(msg.model_dump(exclude_unset=True))
+            # Reconstruct assistant message explicitly so content=None is preserved
+            # (msg.model_dump(exclude_unset=True) may omit null content, breaking the API)
+            assistant_msg: dict = {"role": "assistant", "content": msg.content}
+            if msg.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(assistant_msg)
             messages.extend(tool_results)
 
             # If only express_emotion was called (no real tool), GPT is done

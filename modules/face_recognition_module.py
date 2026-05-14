@@ -39,7 +39,10 @@ class FaceRecognitionModule:
     # ------------------------------------------------------------------
 
     def _load_encodings(self) -> None:
-        if ENCODINGS_PATH.exists():
+        if not ENCODINGS_PATH.exists():
+            logger.info("No existing encodings file found; starting fresh")
+            return
+        try:
             with open(ENCODINGS_PATH, "rb") as f:
                 self._encodings = pickle.load(f)
             logger.info(
@@ -47,13 +50,17 @@ class FaceRecognitionModule:
                 len(self._encodings),
                 list(self._encodings.keys()),
             )
-        else:
-            logger.info("No existing encodings file found; starting fresh")
+        except Exception:
+            logger.exception("Failed to load encodings from %s; starting fresh", ENCODINGS_PATH)
+            self._encodings = {}
 
     def _save_encodings(self) -> None:
-        with open(ENCODINGS_PATH, "wb") as f:
-            pickle.dump(self._encodings, f)
-        logger.info("Encodings saved to %s", ENCODINGS_PATH)
+        try:
+            with open(ENCODINGS_PATH, "wb") as f:
+                pickle.dump(self._encodings, f)
+            logger.info("Encodings saved to %s", ENCODINGS_PATH)
+        except OSError:
+            logger.exception("Failed to save encodings to %s", ENCODINGS_PATH)
 
     # ------------------------------------------------------------------
     # Identification
@@ -63,71 +70,84 @@ class FaceRecognitionModule:
         """
         Return the name of the first recognised person in *frame*, or None.
         Uses the distance metric: a match is accepted when distance < threshold.
+        Returns None if the frame is invalid or any processing step fails.
         """
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb, model="hog")
-        if not locations:
+        if frame is None or frame.size == 0:
             return None
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb, model="hog")
+            if not locations:
+                return None
 
-        encodings = face_recognition.face_encodings(rgb, locations)
-        if not encodings:
+            encodings = face_recognition.face_encodings(rgb, locations)
+            if not encodings:
+                return None
+
+            # Flatten all known encodings into parallel lists
+            known_names: list[str] = []
+            known_encs: list[np.ndarray] = []
+            for name, enc_list in self._encodings.items():
+                for enc in enc_list:
+                    known_names.append(name)
+                    known_encs.append(enc)
+
+            if not known_encs:
+                return None
+
+            probe = encodings[0]
+            distances = face_recognition.face_distance(known_encs, probe)
+            best_idx = int(np.argmin(distances))
+            best_dist = float(distances[best_idx])
+
+            if best_dist < CONFIDENCE_THRESHOLD:
+                name = known_names[best_idx]
+                logger.debug("Recognised '%s' (distance=%.3f)", name, best_dist)
+                return name
+
+            logger.debug("Unknown face (best distance=%.3f)", best_dist)
             return None
-
-        # Flatten all known encodings into parallel lists
-        known_names: list[str] = []
-        known_encs: list[np.ndarray] = []
-        for name, enc_list in self._encodings.items():
-            for enc in enc_list:
-                known_names.append(name)
-                known_encs.append(enc)
-
-        if not known_encs:
+        except Exception:
+            logger.debug("identify() failed", exc_info=True)
             return None
-
-        # Compare first detected face against all knowns
-        probe = encodings[0]
-        distances = face_recognition.face_distance(known_encs, probe)
-        best_idx = int(np.argmin(distances))
-        best_dist = float(distances[best_idx])
-
-        if best_dist < CONFIDENCE_THRESHOLD:
-            name = known_names[best_idx]
-            logger.debug("Recognised '%s' (distance=%.3f)", name, best_dist)
-            return name
-
-        logger.debug("Unknown face (best distance=%.3f)", best_dist)
-        return None
 
     def identify_all(self, frame: np.ndarray) -> list[tuple[str, tuple]]:
         """
         Return [(name, (top, right, bottom, left)), ...] for every face in
         the frame, using 'Unknown' for unrecognised faces.
+        Returns an empty list if the frame is invalid.
         """
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb, model="hog")
-        if not locations:
+        if frame is None or frame.size == 0:
             return []
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb, model="hog")
+            if not locations:
+                return []
 
-        encodings = face_recognition.face_encodings(rgb, locations)
+            encodings = face_recognition.face_encodings(rgb, locations)
 
-        known_names: list[str] = []
-        known_encs: list[np.ndarray] = []
-        for name, enc_list in self._encodings.items():
-            for enc in enc_list:
-                known_names.append(name)
-                known_encs.append(enc)
+            known_names: list[str] = []
+            known_encs: list[np.ndarray] = []
+            for name, enc_list in self._encodings.items():
+                for enc in enc_list:
+                    known_names.append(name)
+                    known_encs.append(enc)
 
-        results = []
-        for enc, loc in zip(encodings, locations):
-            if known_encs:
-                distances = face_recognition.face_distance(known_encs, enc)
-                best_idx = int(np.argmin(distances))
-                best_dist = float(distances[best_idx])
-                name = known_names[best_idx] if best_dist < CONFIDENCE_THRESHOLD else "Unknown"
-            else:
-                name = "Unknown"
-            results.append((name, loc))
-        return results
+            results = []
+            for enc, loc in zip(encodings, locations):
+                if known_encs:
+                    distances = face_recognition.face_distance(known_encs, enc)
+                    best_idx = int(np.argmin(distances))
+                    best_dist = float(distances[best_idx])
+                    name = known_names[best_idx] if best_dist < CONFIDENCE_THRESHOLD else "Unknown"
+                else:
+                    name = "Unknown"
+                results.append((name, loc))
+            return results
+        except Exception:
+            logger.debug("identify_all() failed", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------
     # Registration
@@ -138,8 +158,16 @@ class FaceRecognitionModule:
         Add face encoding(s) from *frame* for *name*.
         Returns True if at least one encoding was extracted.
         """
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        encs = face_recognition.face_encodings(rgb)
+        if frame is None or frame.size == 0:
+            logger.warning("register_person('%s'): invalid frame", name)
+            return False
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            encs = face_recognition.face_encodings(rgb)
+        except Exception:
+            logger.exception("register_person('%s'): encoding failed", name)
+            return False
+
         if not encs:
             logger.warning("No face found in frame for '%s'", name)
             return False
@@ -166,31 +194,37 @@ class FaceRecognitionModule:
         print(f"Will capture {REGISTRATION_SAMPLES} samples. Press 'q' to cancel.")
 
         collected: list[np.ndarray] = []
-        while len(collected) < REGISTRATION_SAMPLES:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            while len(collected) < REGISTRATION_SAMPLES:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            encs = face_recognition.face_encodings(rgb)
-            if encs:
-                collected.append(encs[0])
-                progress = len(collected)
-                cv2.putText(
-                    frame,
-                    f"Captured {progress}/{REGISTRATION_SAMPLES}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
-                )
-                print(f"  Sample {progress}/{REGISTRATION_SAMPLES}")
+                try:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    encs = face_recognition.face_encodings(rgb)
+                except Exception:
+                    logger.debug("Encoding failed for registration frame", exc_info=True)
+                    continue
 
-            cv2.imshow(f"Register '{name}'", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-            time.sleep(0.3)
+                if encs:
+                    collected.append(encs[0])
+                    progress = len(collected)
+                    cv2.putText(
+                        frame,
+                        f"Captured {progress}/{REGISTRATION_SAMPLES}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
+                    )
+                    print(f"  Sample {progress}/{REGISTRATION_SAMPLES}")
 
-        cap.release()
-        cv2.destroyAllWindows()
+                cv2.imshow(f"Register '{name}'", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                time.sleep(0.3)
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
 
         if not collected:
             print("No encodings captured. Aborting.")
@@ -230,6 +264,9 @@ if __name__ == "__main__":
 
     elif args.identify:
         cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print(f"Cannot open camera {args.camera}")
+            raise SystemExit(1)
         print("Press 'q' to quit.")
         while True:
             ret, frame = cap.read()

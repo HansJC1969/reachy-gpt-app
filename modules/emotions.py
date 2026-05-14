@@ -283,7 +283,12 @@ class EmotionEngine:
 
     @property
     def current_emotion(self) -> Emotion:
-        return self._current_emotion
+        with self._lock:
+            return self._current_emotion
+
+    def _set_emotion(self, emotion: Emotion) -> None:
+        with self._lock:
+            self._current_emotion = emotion
 
     def play(self, emotion: Emotion, *, block: bool = False) -> None:
         """
@@ -291,7 +296,7 @@ class EmotionEngine:
         cancelled immediately.  Set block=True to wait for completion.
         """
         self._cancel()
-        self._current_emotion = emotion
+        self._set_emotion(emotion)
         anim = ANIMATIONS.get(emotion, ANIMATIONS[Emotion.NEUTRAL])
         self._stop_evt.clear()
 
@@ -311,11 +316,11 @@ class EmotionEngine:
         """Stop current animation and return to neutral pose."""
         self._cancel()
         self._apply(NEUTRAL_POSE)
-        self._current_emotion = Emotion.NEUTRAL
+        self._set_emotion(Emotion.NEUTRAL)
 
     def idle(self) -> None:
         """Return gently to neutral (used when no face is detected)."""
-        if self._current_emotion != Emotion.NEUTRAL:
+        if self.current_emotion != Emotion.NEUTRAL:
             self.play(Emotion.NEUTRAL)
 
     # ------------------------------------------------------------------
@@ -350,7 +355,7 @@ class EmotionEngine:
         # Always glide back to neutral when done (unless interrupted externally)
         if not self._stop_evt.is_set():
             self._glide_to_neutral(duration=0.8)
-            self._current_emotion = Emotion.NEUTRAL
+            self._set_emotion(Emotion.NEUTRAL)
 
     def _glide_to_neutral(self, duration: float = 0.8) -> None:
         """Smoothly interpolate from current pose to neutral."""
