@@ -70,7 +70,7 @@ def detect_language(text: str) -> str:
 
 # ── Audio device check ────────────────────────────────────────────────────────
 
-def _sounddevice_available() -> bool:
+def sounddevice_available() -> bool:
     """Return True if sounddevice can find at least one output device."""
     try:
         import sounddevice as sd  # type: ignore
@@ -82,7 +82,7 @@ def _sounddevice_available() -> bool:
 
 # ── Speech engine ─────────────────────────────────────────────────────────────
 
-_SENTINEL = None   # signals worker to exit cleanly
+_SENTINEL = object()   # unique sentinel; never put None on the queue directly
 
 
 class SpeechEngine:
@@ -123,7 +123,7 @@ class SpeechEngine:
         self._speed      = max(0.25, min(4.0, speed))
         self._model      = model
         self._sim_mode   = sim_mode
-        self._queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()
         self._stop_evt   = threading.Event()    # stop current utterance
         self._speaking   = threading.Event()    # set while audio is playing
         self._lock       = threading.Lock()
@@ -174,8 +174,10 @@ class SpeechEngine:
 
     def wait_until_done(self, timeout: float = 30.0) -> None:
         """Block until the speech queue is empty and playback has finished."""
+        # queue.join() waits until every queued item has had task_done() called,
+        # which happens after _speaking.clear() in the worker's finally block —
+        # so queue.join() alone is sufficient to wait for completion.
         self._queue.join()
-        self._speaking.wait(timeout=timeout)
 
     def shutdown(self) -> None:
         """Stop speech and terminate the worker thread cleanly."""
@@ -293,7 +295,7 @@ if __name__ == "__main__":
         print(f"Detected language: {lang}")
         sys.exit(0)
 
-    has_audio = _sounddevice_available()
+    has_audio = sounddevice_available()
     if not has_audio and not args.sim:
         print("No audio output device found — running in sim mode.")
         args.sim = True

@@ -359,8 +359,6 @@ class EmotionEngine:
 
     def _glide_to_neutral(self, duration: float = 0.8) -> None:
         """Smoothly interpolate from current pose to neutral."""
-        # Sample current pose as a starting point
-        steps = max(1, int(duration / TICK))
         # Build a two-keyframe mini-animation
         last_pose = NEUTRAL_POSE  # safe approximation; robot tracks last goal_position
         glide = Animation(keyframes=[

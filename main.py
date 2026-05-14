@@ -25,7 +25,6 @@ CLI flags:
 import argparse
 import logging
 import os
-import queue
 import sys
 import threading
 import time
@@ -60,7 +59,7 @@ from modules.memory import (
     load_recent_messages,
     build_memory_context,
 )
-from modules.speech import SpeechEngine, detect_language, _sounddevice_available
+from modules.speech import SpeechEngine, detect_language, sounddevice_available
 from modules.vision import VisionAnalyzer
 from modules.websearch import WebSearcher
 
@@ -92,8 +91,6 @@ class SharedState:
         self.face_lock    = threading.Lock()
         self.person_lock  = threading.Lock()
         self.stop_event   = threading.Event()
-
-        self.conversation_queue: queue.Queue = queue.Queue()
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +410,7 @@ def main() -> None:
     # Text-to-speech
     speech: Optional[SpeechEngine] = None
     if not args.no_speech:
-        sim_mode = args.speech_sim or not _sounddevice_available()
+        sim_mode = args.speech_sim or not sounddevice_available()
         if sim_mode and not args.speech_sim:
             logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
         try:

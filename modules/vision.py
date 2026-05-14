@@ -13,6 +13,7 @@ Standalone:
 import base64
 import logging
 import os
+import threading
 import time
 from typing import Optional
 
@@ -78,6 +79,7 @@ class VisionAnalyzer:
         self._interval = interval
         self._last_analyzed: float = 0.0
         self._last_description: Optional[str] = None
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -86,7 +88,8 @@ class VisionAnalyzer:
     @property
     def last_description(self) -> Optional[str]:
         """Most recent scene description, or None if none yet."""
-        return self._last_description
+        with self._lock:
+            return self._last_description
 
     def analyze(
         self,
@@ -131,12 +134,15 @@ class VisionAnalyzer:
         Returns the description, or None if skipped.
         Updates `last_description` on success.
         """
-        if time.monotonic() - self._last_analyzed < self._interval:
+        with self._lock:
+            last = self._last_analyzed
+        if time.monotonic() - last < self._interval:
             return None
         try:
             desc = self.analyze(frame)
-            self._last_description = desc
-            self._last_analyzed = time.monotonic()
+            with self._lock:
+                self._last_description = desc
+                self._last_analyzed = time.monotonic()
             logger.info("Scene update: %s", desc[:100])
             return desc
         except Exception:
@@ -159,8 +165,9 @@ class VisionAnalyzer:
         )
         try:
             answer = self.analyze(frame, question=prompt, max_tokens=max_tokens)
-            self._last_description = answer
-            self._last_analyzed = time.monotonic()
+            with self._lock:
+                self._last_description = answer
+                self._last_analyzed = time.monotonic()
             return answer
         except Exception:
             logger.exception("Vision on-command failed")

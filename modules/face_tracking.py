@@ -91,6 +91,8 @@ class FaceTracker:
 
     def detect_face(self, frame: np.ndarray) -> Optional[FacePosition]:
         """Return the largest detected face, or None."""
+        if frame is None or frame.size == 0:
+            return None
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
 
@@ -204,6 +206,9 @@ if __name__ == "__main__":
 
     tracker = FaceTracker(reachy=None)
     cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        print(f"Cannot open camera {args.camera}")
+        raise SystemExit(1)
 
     print("Press 'q' to quit.")
     while True:

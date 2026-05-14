@@ -209,8 +209,8 @@ def build_memory_context(person_id: int) -> str:
         ).fetchone()
 
     if person:
-        parts.append(f"You are talking to: {person['name']}.")
+        parts.append(f"Du sprichst mit: {person['name']}.")
         if person["notes"]:
-            parts.append(f"Notes about this person: {person['notes']}")
+            parts.append(f"Notizen zu dieser Person: {person['notes']}")
 
     return "\n\n".join(parts)
