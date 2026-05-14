@@ -126,7 +126,6 @@ class SpeechEngine:
         self._queue: queue.Queue = queue.Queue()
         self._stop_evt   = threading.Event()    # stop current utterance
         self._speaking   = threading.Event()    # set while audio is playing
-        self._lock       = threading.Lock()
 
         self._worker_thread = threading.Thread(
             target=self._worker, name="speech-worker", daemon=True
@@ -173,11 +172,13 @@ class SpeechEngine:
         self._flush()
 
     def wait_until_done(self, timeout: float = 30.0) -> None:
-        """Block until the speech queue is empty and playback has finished."""
-        # queue.join() waits until every queued item has had task_done() called,
-        # which happens after _speaking.clear() in the worker's finally block —
-        # so queue.join() alone is sufficient to wait for completion.
-        self._queue.join()
+        """Block until the speech queue is drained, or *timeout* seconds elapse."""
+        deadline = time.monotonic() + timeout
+        while self._queue.unfinished_tasks > 0:
+            if time.monotonic() >= deadline:
+                logger.warning("wait_until_done: timed out after %.1fs", timeout)
+                return
+            time.sleep(0.05)
 
     def shutdown(self) -> None:
         """Stop speech and terminate the worker thread cleanly."""

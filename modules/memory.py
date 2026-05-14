@@ -6,6 +6,7 @@ Can be imported and used independently of the robot.
 import sqlite3
 import os
 import logging
+from pathlib import Path
 from typing import Optional
 
 import openai
@@ -15,7 +16,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.environ.get("DB_PATH", "reachy_memory.db")
+DB_PATH = Path(os.environ.get("DB_PATH", "reachy_memory.db"))
 SUMMARY_THRESHOLD = 50  # auto-summarize after this many messages per person
 
 
@@ -63,13 +64,9 @@ def init_db() -> None:
 def get_or_create_person(name: str) -> int:
     """Return person_id, creating the record if needed."""
     with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO persons (name) VALUES (?)", (name,))
         row = conn.execute("SELECT id FROM persons WHERE name=?", (name,)).fetchone()
-        if row:
-            return row["id"]
-        cur = conn.execute(
-            "INSERT INTO persons (name) VALUES (?)", (name,)
-        )
-        return cur.lastrowid
+        return row["id"]
 
 
 def list_persons() -> list[dict]:

@@ -16,7 +16,7 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -89,10 +89,6 @@ class Animation:
     keyframes: list[Keyframe]
     loop: bool = False       # repeat keyframes indefinitely
     loop_count: int = 0      # 0 = infinite when loop=True
-
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
 
 
 def _coslerp(a: float, b: float, t: float) -> float:

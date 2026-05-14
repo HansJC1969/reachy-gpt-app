@@ -102,6 +102,8 @@ class VisionAnalyzer:
         If *question* is given it is used as the prompt; otherwise
         the generic scene-description prompt is used.
         """
+        if frame is None or frame.size == 0:
+            raise ValueError("analyze() received an invalid (None or empty) frame")
         prompt = question or _SCENE_PROMPT
         b64 = _encode_frame(frame)
 
@@ -175,7 +177,8 @@ class VisionAnalyzer:
 
     def reset_timer(self) -> None:
         """Force next analyze_periodic() call to run immediately."""
-        self._last_analyzed = 0.0
+        with self._lock:
+            self._last_analyzed = 0.0
 
 
 # ---------------------------------------------------------------------------

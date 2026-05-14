@@ -338,7 +338,7 @@ class ConversationManager:
             prompt += f"\n\nDie Person vor dir ist {self._current_person}."
         # Inject latest scene description so GPT has passive scene awareness
         if self._vision and self._vision.last_description:
-            prompt += f"\n\nCurrent scene (from your camera): {self._vision.last_description}"
+            prompt += f"\n\nAktuelle Szene (durch deine Kamera): {self._vision.last_description}"
         return prompt
 
     def _build_messages(
