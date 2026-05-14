@@ -14,7 +14,7 @@ CLI flags:
   --no-robot          Run without a physical Reachy (simulation mode)
   --setup             Initialise the SQLite database and exit
   --add-person "Name" Register a new face and exit
-  --camera INDEX      Camera device index for --no-robot simulation (default: $CAMERA_INDEX or 0)
+  --camera INDEX      OpenCV device index used only in --no-robot sim mode (default: $CAMERA_INDEX or 0)
   --emotion-test      Play each emotion in sequence and exit
   --no-vision         Disable automatic scene analysis
   --no-search         Disable web search
@@ -25,8 +25,6 @@ CLI flags:
 import argparse
 import logging
 import os
-import socket
-import struct
 import sys
 import threading
 import time
@@ -69,15 +67,11 @@ from modules.websearch import WebSearcher
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-RECOGNITION_INTERVAL  = 15       # run face recognition every N frames
-VISION_INTERVAL       = 10.0    # seconds between automatic scene analyses
-IDLE_TIMEOUT          = 12.0    # seconds without a face before MÜDE animation
-CAMERA_INDEX          = int(os.environ.get("CAMERA_INDEX", "0"))
-REACHY_CAMERA_SOCKET  = os.environ.get("REACHY_CAMERA_SOCKET", "/tmp/reachymini_camera_socket")
-UNKNOWN_PERSON_NAME   = "Stranger"
-
-# 4-byte big-endian frame-size prefix used by the Reachy Mini camera socket
-_FRAME_HEADER = struct.Struct("!I")
+RECOGNITION_INTERVAL = 15       # run face recognition every N frames
+VISION_INTERVAL      = 10.0    # seconds between automatic scene analyses
+IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
+CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
+UNKNOWN_PERSON_NAME  = "Stranger"
 
 
 # ---------------------------------------------------------------------------
@@ -101,84 +95,6 @@ class SharedState:
 
 
 # ---------------------------------------------------------------------------
-# Reachy Mini camera — Unix socket reader
-# ---------------------------------------------------------------------------
-
-class ReachyCameraCapture:
-    """
-    Reads BGR frames from the Reachy Mini camera Unix socket.
-
-    Wire protocol: each frame is preceded by a 4-byte big-endian uint32
-    containing the JPEG payload size, followed by that many bytes of
-    JPEG-encoded image data.
-    """
-
-    def __init__(self, socket_path: str = REACHY_CAMERA_SOCKET) -> None:
-        self._path = socket_path
-        self._sock: Optional[socket.socket] = None
-        self._connect()
-
-    def _connect(self) -> bool:
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(self._path)
-            s.settimeout(2.0)
-            self._sock = s
-            logger.info("Connected to Reachy camera socket %s", self._path)
-            return True
-        except OSError as exc:
-            logger.error("Cannot connect to camera socket %s: %s", self._path, exc)
-            return False
-
-    def isOpened(self) -> bool:
-        return self._sock is not None
-
-    def _recv_exactly(self, n: int) -> bytes:
-        buf = bytearray(n)
-        view = memoryview(buf)
-        received = 0
-        while received < n:
-            chunk = self._sock.recv(n - received)
-            if not chunk:
-                raise ConnectionError("Camera socket closed by peer")
-            view[received: received + len(chunk)] = chunk
-            received += len(chunk)
-        return bytes(buf)
-
-    def read(self) -> tuple[bool, Optional[np.ndarray]]:
-        if self._sock is None and not self._connect():
-            return False, None
-        try:
-            raw_len = self._recv_exactly(_FRAME_HEADER.size)
-            frame_size = _FRAME_HEADER.unpack(raw_len)[0]
-            if frame_size == 0 or frame_size > 10 * 1024 * 1024:
-                raise ValueError(f"Implausible frame size: {frame_size} bytes")
-            data  = self._recv_exactly(frame_size)
-            frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is None:
-                raise ValueError("cv2.imdecode returned None — not a valid JPEG")
-            return True, frame
-        except Exception as exc:
-            logger.warning("Camera socket error: %s — reconnecting", exc)
-            self._connect()
-            return False, None
-
-    def release(self) -> None:
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-
-
-# ---------------------------------------------------------------------------
 # Thread: camera capture
 # ---------------------------------------------------------------------------
 
@@ -186,41 +102,72 @@ def camera_loop(
     state: SharedState,
     tracker: FaceTracker,
     camera_idx: int,
-    robot_camera: bool,
+    reachy,
 ) -> None:
-    if robot_camera:
-        cap: ReachyCameraCapture | cv2.VideoCapture = ReachyCameraCapture()
-        label = f"Reachy socket ({REACHY_CAMERA_SOCKET})"
+    """
+    When running on the robot (reachy is not None) frames are read via
+    reachy.media.get_frame(), which uses the SDK's local IPC backend —
+    the correct path when SSHed into Reachy Mini.
+
+    In --no-robot simulation mode (reachy is None) OpenCV VideoCapture is
+    used with the device index supplied by --camera.
+    """
+    if reachy is not None:
+        logger.info("Camera thread started (Reachy Mini SDK media.get_frame())")
+        while not state.stop_event.is_set():
+            try:
+                frame = reachy.media.get_frame()
+            except Exception:
+                logger.warning("media.get_frame() failed; retrying…", exc_info=True)
+                time.sleep(0.05)
+                continue
+
+            if frame is None:
+                time.sleep(0.033)
+                continue
+
+            # SDK returns RGB; convert to BGR for OpenCV-based processing
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            with state.frame_lock:
+                state.latest_frame = frame.copy()
+
+            face = tracker.detect_face(frame)
+            with state.face_lock:
+                state.latest_face = face
+                if face is not None:
+                    state.last_face_seen = time.monotonic()
+
+        logger.info("Camera thread stopped")
+
     else:
         cap = cv2.VideoCapture(camera_idx)
-        label = f"device {camera_idx}"
+        if not cap.isOpened():
+            logger.error("Cannot open camera device %d", camera_idx)
+            state.stop_event.set()
+            return
 
-    if not cap.isOpened():
-        logger.error("Cannot open camera (%s)", label)
-        state.stop_event.set()
-        return
+        logger.info("Camera thread started (OpenCV device %d)", camera_idx)
+        while not state.stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Camera read failed; retrying…")
+                time.sleep(0.05)
+                continue
 
-    logger.info("Camera thread started (%s)", label)
-    while not state.stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            logger.warning("Camera read failed; retrying…")
-            time.sleep(0.05)
-            continue
+            with state.frame_lock:
+                state.latest_frame = frame.copy()
 
-        with state.frame_lock:
-            state.latest_frame = frame.copy()
+            face = tracker.detect_face(frame)
+            with state.face_lock:
+                state.latest_face = face
+                if face is not None:
+                    state.last_face_seen = time.monotonic()
 
-        face = tracker.detect_face(frame)
-        with state.face_lock:
-            state.latest_face = face
-            if face is not None:
-                state.last_face_seen = time.monotonic()
+            time.sleep(0.033)   # ~30 fps
 
-        time.sleep(0.033)   # ~30 fps
-
-    cap.release()
-    logger.info("Camera thread stopped")
+        cap.release()
+        logger.info("Camera thread stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +369,11 @@ def build_reachy():
     try:
         from reachy_mini import ReachyMini  # type: ignore
         logger.info("Connecting to Reachy Mini…")
-        # media_backend="no_media" releases the camera/audio hardware so OpenCV
-        # and sounddevice can access them directly (required by this app).
-        reachy = ReachyMini(media_backend="no_media")
+        # Default media backend: SDK manages the camera via GStreamer IPC.
+        # Frames are read with reachy.media.get_frame() in camera_loop.
+        # sounddevice (TTS output) uses the speaker independently and does
+        # not conflict with the SDK's microphone/camera management.
+        reachy = ReachyMini()
         reachy.__enter__()
         logger.info("Connected to Reachy Mini")
         return reachy
@@ -540,7 +489,7 @@ def main() -> None:
     # Build thread list — vision_loop only started when vision module is active.
     # Use None as target sentinel; the loop below skips those entries.
     thread_specs = [
-        ("camera",       True,  camera_loop,                               (state, tracker, args.camera, not args.no_robot)),
+        ("camera",       True,  camera_loop,                               (state, tracker, args.camera, reachy)),
         ("tracking",     True,  tracking_loop,                              (state, tracker)),
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
         ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
