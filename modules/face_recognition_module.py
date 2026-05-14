@@ -1,13 +1,15 @@
 """
-Face recognition using MediaPipe FaceMesh.
+Face recognition using OpenCV Haar cascade detection and normalized face-crop
+embeddings.  No external models or downloads required beyond opencv-python.
 
-Embeddings are 936-dimensional vectors built from the (x, y) coordinates of
-all 468 FaceMesh landmarks, centred and L2-normalised to be pose-robust.
-Similarity is measured with cosine distance (lower = more similar).
+Each registered face is stored as a 4096-dim L2-normalized vector built from
+a histogram-equalized 64×64 grayscale crop of the detected face region.
+Identification uses cosine distance; a match is accepted when the distance is
+below CONFIDENCE_THRESHOLD (default 0.5 — lower is stricter).
 
-CONFIDENCE_THRESHOLD (default 0.5) is the maximum cosine distance accepted as
-a match — lower values are stricter.  Same-person distances are typically
-0.02–0.15; different people are typically 0.3–0.8.
+Typical distances:
+  same person  : 0.02 – 0.20
+  different    : 0.25 – 0.80
 
 Standalone registration:
     python -m modules.face_recognition_module --add-person "Alice"
@@ -22,25 +24,25 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 from modules.memory import get_or_create_person, init_db
 
 logger = logging.getLogger(__name__)
 
-ENCODINGS_PATH        = Path(os.environ.get("ENCODINGS_PATH", "face_encodings.pkl"))
-CONFIDENCE_THRESHOLD  = float(os.environ.get("FACE_CONFIDENCE_THRESHOLD", "0.5"))
-REGISTRATION_SAMPLES  = 5
+ENCODINGS_PATH       = Path(os.environ.get("ENCODINGS_PATH", "face_encodings.pkl"))
+CONFIDENCE_THRESHOLD = float(os.environ.get("FACE_CONFIDENCE_THRESHOLD", "0.5"))
+REGISTRATION_SAMPLES = 5
 
-# 468 FaceMesh landmarks × 2 (x, y) = 936-dimensional embedding
-_EMBEDDING_DIM = 468 * 2
+# Face crop is resized to CROP_SIZE × CROP_SIZE before flattening
+_CROP_SIZE     = 64
+_EMBEDDING_DIM = _CROP_SIZE * _CROP_SIZE   # 4096
 
-_mp_face_mesh = mp.solutions.face_mesh
+_CASCADE_PATH  = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
 
 def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine distance in [0, 2].  0 = identical, 2 = opposite."""
+    """Cosine distance in [0, 2].  0 = identical."""
     denom = float(np.linalg.norm(a) * np.linalg.norm(b))
     if denom < 1e-8:
         return 2.0
@@ -49,75 +51,88 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 class FaceRecognitionModule:
     def __init__(self) -> None:
-        # {name: list[np.ndarray]}  — each array is shape (_EMBEDDING_DIM,)
+        # {name: list[np.ndarray]}  — each array has shape (_EMBEDDING_DIM,)
         self._encodings: dict[str, list] = {}
-        # static_image_mode=True: every frame processed independently (no temporal carryover)
-        self._mesh = _mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=5,
-            refine_landmarks=False,
-            min_detection_confidence=0.5,
-        )
+        self._cascade = cv2.CascadeClassifier(_CASCADE_PATH)
+        if self._cascade.empty():
+            raise RuntimeError(f"Failed to load cascade from {_CASCADE_PATH}")
         self._load_encodings()
 
     # ------------------------------------------------------------------
-    # Embedding extraction
+    # Internal helpers
     # ------------------------------------------------------------------
 
+    def _detect_faces(
+        self, gray: np.ndarray
+    ) -> list[tuple[int, int, int, int]]:
+        """Return list of (x, y, w, h) for all detected faces."""
+        faces = self._cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(40, 40),
+        )
+        return [tuple(f) for f in faces] if len(faces) > 0 else []
+
+    def _crop_to_embedding(
+        self, gray: np.ndarray, x: int, y: int, w: int, h: int
+    ) -> Optional[np.ndarray]:
+        """
+        Crop *gray* to the face bbox (with 10 % padding), resize to
+        _CROP_SIZE × _CROP_SIZE, histogram-equalize, and return an
+        L2-normalized float32 vector of length _EMBEDDING_DIM.
+        """
+        fh, fw = gray.shape[:2]
+        pad_x = max(1, int(w * 0.10))
+        pad_y = max(1, int(h * 0.10))
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(fw, x + w + pad_x)
+        y2 = min(fh, y + h + pad_y)
+        crop = gray[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        crop = cv2.resize(crop, (_CROP_SIZE, _CROP_SIZE))
+        crop = cv2.equalizeHist(crop)
+        vec  = crop.flatten().astype(np.float32)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        return vec
+
     def _extract_embedding(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Return a normalised 936-dim landmark embedding for the first face in
-        *frame*, or None if no face is detected.
-        """
+        """Return an embedding for the largest face in *frame*, or None."""
         if frame is None or frame.size == 0:
             return None
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._mesh.process(rgb)
-        if not results.multi_face_landmarks:
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray  = cv2.equalizeHist(gray)
+        faces = self._detect_faces(gray)
+        if not faces:
             return None
-        lms = results.multi_face_landmarks[0].landmark
-        coords = np.array([[lm.x, lm.y] for lm in lms], dtype=np.float32)  # (468, 2)
-        coords -= coords.mean(axis=0)           # centre on face
-        norm = np.linalg.norm(coords)
-        if norm > 0:
-            coords /= norm                      # scale-normalise
-        return coords.flatten()                 # (936,)
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        return self._crop_to_embedding(gray, x, y, w, h)
 
     def _extract_all_embeddings(
         self, frame: np.ndarray
     ) -> list[tuple[np.ndarray, tuple[int, int, int, int]]]:
         """
-        Return [(embedding, (top, right, bottom, left)), ...] for every face
-        detected in *frame*.
+        Return [(embedding, (top, right, bottom, left)), ...] for every
+        detected face in *frame*.
         """
         if frame is None or frame.size == 0:
             return []
         fh, fw = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._mesh.process(rgb)
-        if not results.multi_face_landmarks:
-            return []
-
-        output = []
-        for face_lms in results.multi_face_landmarks:
-            lms = face_lms.landmark
-            coords = np.array([[lm.x, lm.y] for lm in lms], dtype=np.float32)
-
-            # Bounding box from landmark extents (top, right, bottom, left)
-            xs, ys = coords[:, 0], coords[:, 1]
-            bbox = (
-                max(0, int(ys.min() * fh)),   # top
-                min(fw, int(xs.max() * fw)),  # right
-                min(fh, int(ys.max() * fh)),  # bottom
-                max(0, int(xs.min() * fw)),   # left
-            )
-
-            coords -= coords.mean(axis=0)
-            norm = np.linalg.norm(coords)
-            if norm > 0:
-                coords /= norm
-            output.append((coords.flatten(), bbox))
-        return output
+        gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray   = cv2.equalizeHist(gray)
+        faces  = self._detect_faces(gray)
+        result = []
+        for x, y, w, h in faces:
+            emb = self._crop_to_embedding(gray, x, y, w, h)
+            if emb is None:
+                continue
+            bbox = (y, min(fw, x + w), min(fh, y + h), x)  # top,right,bottom,left
+            result.append((emb, bbox))
+        return result
 
     def _best_match(
         self,
@@ -125,18 +140,27 @@ class FaceRecognitionModule:
         known_names: list[str],
         known_encs: list[np.ndarray],
     ) -> tuple[Optional[str], float]:
-        """Return (name, distance) for the closest known encoding, or (None, 2.0)."""
+        """Return (name, distance) of the closest known face, or (None, 2.0)."""
         if not known_encs:
             return None, 2.0
         distances = np.array([_cosine_distance(embedding, e) for e in known_encs])
-        best_idx  = int(np.argmin(distances))
-        best_dist = float(distances[best_idx])
-        if best_dist < CONFIDENCE_THRESHOLD:
-            return known_names[best_idx], best_dist
-        return None, best_dist
+        idx  = int(np.argmin(distances))
+        dist = float(distances[idx])
+        if dist < CONFIDENCE_THRESHOLD:
+            return known_names[idx], dist
+        return None, dist
+
+    def _flat_known(self) -> tuple[list[str], list[np.ndarray]]:
+        names: list[str]       = []
+        encs:  list[np.ndarray] = []
+        for name, enc_list in self._encodings.items():
+            for enc in enc_list:
+                names.append(name)
+                encs.append(enc)
+        return names, encs
 
     # ------------------------------------------------------------------
-    # Encoding persistence
+    # Persistence
     # ------------------------------------------------------------------
 
     def _load_encodings(self) -> None:
@@ -147,8 +171,8 @@ class FaceRecognitionModule:
             with open(ENCODINGS_PATH, "rb") as f:
                 data = pickle.load(f)
 
-            # Validate embedding dimension — old face_recognition (128-dim dlib)
-            # encodings are incompatible and must be discarded.
+            # Validate embedding dimension — old mediapipe (936-dim) or
+            # dlib (128-dim) encodings are incompatible and must be discarded.
             compatible = all(
                 isinstance(enc, np.ndarray) and enc.shape == (_EMBEDDING_DIM,)
                 for enc_list in data.values()
@@ -162,8 +186,9 @@ class FaceRecognitionModule:
                 )
             else:
                 logger.warning(
-                    "Encodings file has incompatible format (old face_recognition/dlib "
-                    "encodings?). Resetting — please re-register all persons with --add-person."
+                    "Encodings file has incompatible format (old dlib/mediapipe "
+                    "encodings?). Resetting — please re-register all persons "
+                    "with --add-person."
                 )
                 self._encodings = {}
         except Exception:
@@ -179,7 +204,7 @@ class FaceRecognitionModule:
             logger.exception("Failed to save encodings to %s", ENCODINGS_PATH)
 
     # ------------------------------------------------------------------
-    # Identification
+    # Public API
     # ------------------------------------------------------------------
 
     def identify(self, frame: np.ndarray) -> Optional[str]:
@@ -193,19 +218,12 @@ class FaceRecognitionModule:
             embedding = self._extract_embedding(frame)
             if embedding is None:
                 return None
-
-            known_names: list[str] = []
-            known_encs:  list[np.ndarray] = []
-            for name, enc_list in self._encodings.items():
-                for enc in enc_list:
-                    known_names.append(name)
-                    known_encs.append(enc)
-
-            name, dist = self._best_match(embedding, known_names, known_encs)
+            names, encs = self._flat_known()
+            name, dist  = self._best_match(embedding, names, encs)
             if name:
-                logger.debug("Recognised '%s' (cosine distance=%.3f)", name, dist)
+                logger.debug("Recognised '%s' (cosine dist=%.3f)", name, dist)
             else:
-                logger.debug("Unknown face (best distance=%.3f)", dist)
+                logger.debug("Unknown face (best dist=%.3f)", dist)
             return name
         except Exception:
             logger.debug("identify() failed", exc_info=True)
@@ -222,41 +240,28 @@ class FaceRecognitionModule:
             faces = self._extract_all_embeddings(frame)
             if not faces:
                 return []
-
-            known_names: list[str] = []
-            known_encs:  list[np.ndarray] = []
-            for name, enc_list in self._encodings.items():
-                for enc in enc_list:
-                    known_names.append(name)
-                    known_encs.append(enc)
-
+            names, encs = self._flat_known()
             results = []
             for embedding, bbox in faces:
-                name, _ = self._best_match(embedding, known_names, known_encs)
+                name, _ = self._best_match(embedding, names, encs)
                 results.append((name or "Unknown", bbox))
             return results
         except Exception:
             logger.debug("identify_all() failed", exc_info=True)
             return []
 
-    # ------------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------------
-
     def register_person(self, name: str, frame: np.ndarray) -> bool:
         """
-        Add face embedding(s) from *frame* for *name*.
-        Returns True if at least one embedding was extracted.
+        Add a face embedding from *frame* for *name*.
+        Returns True if a face was found and stored.
         """
         if frame is None or frame.size == 0:
             logger.warning("register_person('%s'): invalid frame", name)
             return False
-
         embedding = self._extract_embedding(frame)
         if embedding is None:
             logger.warning("No face found in frame for '%s'", name)
             return False
-
         if name not in self._encodings:
             self._encodings[name] = []
         self._encodings[name].append(embedding)
