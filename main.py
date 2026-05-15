@@ -63,7 +63,7 @@ from modules.memory import (
     build_memory_context,
 )
 from modules.profiles import list_profiles, load_profile
-from modules.speech import SpeechEngine, AVAILABLE_VOICES, detect_language, sounddevice_available
+from modules.speech import SpeechEngine, AVAILABLE_VOICES, DEFAULT_VOICE, detect_language, sounddevice_available
 from modules.stt import SpeechToText
 from modules.vision import VisionAnalyzer
 from modules.websearch import WebSearcher
@@ -484,7 +484,8 @@ def main() -> None:
         "--voice",
         default=None,
         choices=sorted(AVAILABLE_VOICES),
-        help="Override TTS voice (overrides profile voice.txt)",
+        help="Override TTS voice. onyx-de (male German, default) and nova-de (female German) "
+             "use gpt-4o-mini-tts with native German pronunciation instructions.",
     )
     args = parser.parse_args()
 
@@ -560,7 +561,7 @@ def main() -> None:
                 logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
         try:
             speech = SpeechEngine(
-                voice=active_voice or "coral",
+                voice=active_voice or DEFAULT_VOICE,
                 sim_mode=sim_mode,
                 reachy=reachy,
             )

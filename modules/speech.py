@@ -48,23 +48,61 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE     = 24_000        # OpenAI PCM output: 24 kHz, 16-bit, mono
 _SDK_RATE       = 16_000        # Reachy Mini SDK audio rate (push_audio_sample)
 _SDK_CHUNK_SIZE = _SDK_RATE // 4  # 250 ms chunks for interruptible SDK playback
-DEFAULT_VOICE = os.environ.get("REACHY_VOICE", "coral")
 DEFAULT_SPEED = float(os.environ.get("REACHY_SPEECH_SPEED", "1.0"))
-DEFAULT_MODEL = os.environ.get("REACHY_TTS_MODEL", "tts-1")   # or "tts-1-hd"
 
-# OpenAI TTS voices for tts-1 / tts-1-hd
-# coral  — warm, versatile (good default for German + English)
-# nova   — bright, friendly
-# onyx   — deep, cinematic
-# echo   — bold, clear
-# shimmer — energetic, bright
-# alloy  — neutral, precise
-# ash    — calm, measured
-# fable  — expressive, quirky
-# sage   — wise, thoughtful
-AVAILABLE_VOICES = frozenset({
-    "alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"
-})
+# ── Voice configuration table ────────────────────────────────────────────────
+#
+# German-optimised voices use gpt-4o-mini-tts with explicit pronunciation
+# instructions that lock in native German phonetics and intonation.
+# Standard voices use tts-1 (or tts-1-hd via REACHY_TTS_MODEL env var).
+#
+# keys
+#   model         : OpenAI TTS model to use
+#   base_voice    : underlying OpenAI voice name
+#   instructions  : voice shaping prompt (gpt-4o-mini-tts only; None for tts-1)
+#   supports_speed: tts-1 accepts speed=; gpt-4o-mini-tts does not
+#
+_VOICE_CONFIGS: dict[str, dict] = {
+    # ── Standard voices (tts-1) ────────────────────────────────────────────
+    "alloy":   {"model": "tts-1", "base_voice": "alloy",   "instructions": None, "supports_speed": True},
+    "ash":     {"model": "tts-1", "base_voice": "ash",     "instructions": None, "supports_speed": True},
+    "coral":   {"model": "tts-1", "base_voice": "coral",   "instructions": None, "supports_speed": True},
+    "echo":    {"model": "tts-1", "base_voice": "echo",    "instructions": None, "supports_speed": True},
+    "fable":   {"model": "tts-1", "base_voice": "fable",   "instructions": None, "supports_speed": True},
+    "nova":    {"model": "tts-1", "base_voice": "nova",    "instructions": None, "supports_speed": True},
+    "onyx":    {"model": "tts-1", "base_voice": "onyx",    "instructions": None, "supports_speed": True},
+    "sage":    {"model": "tts-1", "base_voice": "sage",    "instructions": None, "supports_speed": True},
+    "shimmer": {"model": "tts-1", "base_voice": "shimmer", "instructions": None, "supports_speed": True},
+    # ── German-optimised voices (gpt-4o-mini-tts) ─────────────────────────
+    # onyx-de  ★ DEFAULT — male, deep and calm, native German pronunciation
+    "onyx-de": {
+        "model": "gpt-4o-mini-tts",
+        "base_voice": "onyx",
+        "instructions": (
+            "Sprich ausschließlich auf Deutsch mit vollständig muttersprachlicher Aussprache "
+            "und natürlicher deutscher Satzmelodie. Betone Umlaute (ä, ö, ü) und das ß korrekt. "
+            "Dein Tonfall ist ruhig, freundlich und klar."
+        ),
+        "supports_speed": False,
+    },
+    # nova-de — female, warm and bright, native German pronunciation
+    "nova-de": {
+        "model": "gpt-4o-mini-tts",
+        "base_voice": "nova",
+        "instructions": (
+            "Sprich ausschließlich auf Deutsch mit vollständig muttersprachlicher Aussprache "
+            "und natürlicher deutscher Satzmelodie. Betone Umlaute (ä, ö, ü) und das ß korrekt. "
+            "Dein Tonfall ist warm, freundlich und einladend."
+        ),
+        "supports_speed": False,
+    },
+}
+
+# Default: male German-optimised voice; override with REACHY_VOICE env var
+DEFAULT_VOICE = os.environ.get("REACHY_VOICE", "onyx-de")
+
+# Set of all valid voice identifiers (used for validation and CLI choices)
+AVAILABLE_VOICES: frozenset[str] = frozenset(_VOICE_CONFIGS)
 
 # ── Language detection ────────────────────────────────────────────────────────
 
@@ -140,7 +178,6 @@ class SpeechEngine:
         api_key:  Optional[str] = None,
         voice:    str   = DEFAULT_VOICE,
         speed:    float = DEFAULT_SPEED,
-        model:    str   = DEFAULT_MODEL,
         sim_mode: bool  = False,
         reachy=None,
     ) -> None:
@@ -148,18 +185,24 @@ class SpeechEngine:
         if not key:
             raise EnvironmentError("OPENAI_API_KEY not set — SpeechEngine cannot initialise")
         if voice not in AVAILABLE_VOICES:
-            logger.warning("Unknown voice %r — falling back to 'nova'", voice)
-            voice = "nova"
+            logger.warning("Unknown voice %r — falling back to %r", voice, DEFAULT_VOICE)
+            voice = DEFAULT_VOICE
 
-        self._client     = openai.OpenAI(api_key=key)
-        self._voice      = voice
-        self._speed      = max(0.25, min(4.0, speed))
-        self._model      = model
-        self._sim_mode   = sim_mode
-        self._reachy     = reachy
+        cfg = _VOICE_CONFIGS[voice]
+
+        self._client       = openai.OpenAI(api_key=key)
+        self._voice        = voice
+        self._speed        = max(0.25, min(4.0, speed))
+        # For standard tts-1 voices the model can be upgraded to tts-1-hd via env var
+        tts1_model = os.environ.get("REACHY_TTS_MODEL", "tts-1")
+        self._tts_model    = tts1_model if cfg["supports_speed"] else cfg["model"]
+        self._base_voice   = cfg["base_voice"]
+        self._instructions = cfg["instructions"]
+        self._sim_mode     = sim_mode
+        self._reachy       = reachy
         self._queue: queue.Queue = queue.Queue()
-        self._stop_evt   = threading.Event()    # stop current utterance
-        self._speaking   = threading.Event()    # set while audio is playing
+        self._stop_evt     = threading.Event()
+        self._speaking     = threading.Event()
 
         self._worker_thread = threading.Thread(
             target=self._worker, name="speech-worker", daemon=True
@@ -167,8 +210,8 @@ class SpeechEngine:
         self._worker_thread.start()
         backend = "SDK (GStreamer)" if reachy is not None else ("sim" if sim_mode else "sounddevice")
         logger.info(
-            "SpeechEngine ready — voice=%s  speed=%.2f  model=%s  backend=%s",
-            self._voice, self._speed, self._model, backend,
+            "SpeechEngine ready — voice=%s  model=%s  backend=%s",
+            self._voice, self._tts_model, backend,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -257,14 +300,20 @@ class SpeechEngine:
 
     def _synthesize(self, text: str) -> Optional[np.ndarray]:
         """Call OpenAI TTS and return PCM audio as a numpy int16 array."""
+        kwargs: dict = {
+            "model":           self._tts_model,
+            "voice":           self._base_voice,
+            "input":           text,
+            "response_format": "pcm",   # raw 24 kHz 16-bit mono, no decoder needed
+        }
+        cfg = _VOICE_CONFIGS[self._voice]
+        if cfg["supports_speed"]:
+            kwargs["speed"] = self._speed
+        if self._instructions:
+            kwargs["instructions"] = self._instructions
+
         try:
-            response = self._client.audio.speech.create(
-                model=self._model,
-                voice=self._voice,
-                input=text,
-                response_format="pcm",   # raw 24 kHz 16-bit mono, no decoder needed
-                speed=self._speed,
-            )
+            response = self._client.audio.speech.create(**kwargs)
             pcm_bytes = response.content
             return np.frombuffer(pcm_bytes, dtype=np.int16).copy()
         except openai.APIError as exc:
@@ -347,11 +396,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Reachy TTS standalone test")
     parser.add_argument("text", nargs="?", default="Hallo! Ich bin Reachy, dein freundlicher Roboter.")
-    parser.add_argument("--voice",  default=DEFAULT_VOICE,
-                        choices=sorted(AVAILABLE_VOICES))
-    parser.add_argument("--speed",  type=float, default=DEFAULT_SPEED)
-    parser.add_argument("--model",  default=DEFAULT_MODEL, choices=["tts-1", "tts-1-hd"])
-    parser.add_argument("--sim",    action="store_true", help="Simulate playback (no audio output)")
+    parser.add_argument("--voice", default=DEFAULT_VOICE, choices=sorted(AVAILABLE_VOICES),
+                        help="TTS voice (onyx-de/nova-de = German-optimised)")
+    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED,
+                        help="Speed multiplier 0.25–4.0 (ignored for German-optimised voices)")
+    parser.add_argument("--sim",   action="store_true", help="Simulate playback (no audio output)")
     parser.add_argument("--detect-lang", action="store_true", help="Only detect language, no TTS")
     args = parser.parse_args()
 
@@ -365,7 +414,9 @@ if __name__ == "__main__":
         print("No audio output device found — running in sim mode.")
         args.sim = True
 
-    engine = SpeechEngine(voice=args.voice, speed=args.speed, model=args.model, sim_mode=args.sim)
+    cfg = _VOICE_CONFIGS[args.voice]
+    print(f"Voice: {args.voice}  model: {cfg['model']}  base: {cfg['base_voice']}")
+    engine = SpeechEngine(voice=args.voice, speed=args.speed, sim_mode=args.sim)
     print(f"Speaking [{detect_language(args.text)}]: {args.text!r}")
     engine.speak(args.text)
     engine.wait_until_done()
