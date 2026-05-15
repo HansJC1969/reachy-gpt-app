@@ -323,16 +323,15 @@ def conversation_loop(
                 speech.speak(greeting, interrupt=True)
 
         if stt is not None:
-            # Wait for any ongoing TTS to finish so the mic doesn't capture
-            # Reachy's own voice, then give the speaker a moment to settle.
-            if speech:
-                speech.wait_until_done(timeout=60.0)
-                time.sleep(0.4)
-
+            # speaking_guard hands off echo-cancellation to listen_and_transcribe:
+            # it will wait for TTS to drain, then add a 1 s speaker-settle delay
+            # and mute the mic mid-recording if TTS fires unexpectedly.
             print(f"[{current_person_name}] Sprechen… (Stille zum Beenden)", flush=True)
             try:
                 user_input = stt.listen_and_transcribe(
-                    timeout=30.0, stop_event=state.stop_event
+                    timeout=30.0,
+                    stop_event=state.stop_event,
+                    speaking_guard=speech,
                 )
             except KeyboardInterrupt:
                 state.stop_event.set()

@@ -174,17 +174,34 @@ class SpeechToText:
         self,
         timeout: float = MAX_DURATION,
         stop_event: Optional[threading.Event] = None,
+        speaking_guard=None,
     ) -> Optional[str]:
         """
         Block until speech is detected, record until silence, return transcript.
 
+        Parameters
+        ----------
+        speaking_guard : SpeechEngine or any object with .is_active property
+            When provided, the microphone is muted while the guard reports
+            active TTS playback.  After TTS finishes, a 1-second settle delay
+            is applied before recording starts, preventing echo.
+
         Returns the stripped transcript string, or None if timed out,
         stop_event was set, no speech was detected, or transcription failed.
         """
+        # ── Echo cancellation gate ────────────────────────────────────────────
+        if speaking_guard is not None:
+            while getattr(speaking_guard, "is_active", False):
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                time.sleep(0.05)
+            # Allow speaker cone and GStreamer buffer to fully drain
+            time.sleep(1.0)
+
         if self._reachy is not None:
-            audio = self._record_sdk(timeout, stop_event)
+            audio = self._record_sdk(timeout, stop_event, speaking_guard)
         else:
-            audio = self._record_sounddevice(timeout, stop_event)
+            audio = self._record_sounddevice(timeout, stop_event, speaking_guard)
 
         if audio is None:
             return None
@@ -200,6 +217,7 @@ class SpeechToText:
         self,
         timeout: float,
         stop_event: Optional[threading.Event],
+        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         try:
             self._reachy.media.start_recording()
@@ -216,6 +234,7 @@ class SpeechToText:
                 timeout,
                 stop_event,
                 is_speech_fn=self._sdk_is_speech,
+                speaking_guard=speaking_guard,
             )
         finally:
             try:
@@ -255,6 +274,7 @@ class SpeechToText:
         self,
         timeout: float,
         stop_event: Optional[threading.Event],
+        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         try:
             import sounddevice as sd  # type: ignore
@@ -282,8 +302,8 @@ class SpeechToText:
                 return None
 
         try:
-            # sounddevice path: no DoA available, use energy RMS only
-            return self._vad_loop(chunk_fn, timeout, stop_event, is_speech_fn=None)
+            return self._vad_loop(chunk_fn, timeout, stop_event,
+                                  is_speech_fn=None, speaking_guard=speaking_guard)
         finally:
             try:
                 stream.stop()
@@ -299,6 +319,7 @@ class SpeechToText:
         timeout: float,
         stop_event: Optional[threading.Event],
         is_speech_fn: Optional[Callable[[], bool]] = None,
+        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         """
         Read audio chunks from *chunk_fn*, apply VAD, and return a mono
@@ -311,6 +332,10 @@ class SpeechToText:
 
         Speech detection (sounddevice path):
           RMS >= threshold only.
+
+        Echo cancellation:
+          When speaking_guard.is_active is True, all chunks are discarded and
+          VAD state is reset — prevents Reachy's own voice from triggering STT.
         """
         chunks:        list[np.ndarray] = []
         speech_chunks  = 0
@@ -323,6 +348,16 @@ class SpeechToText:
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return None
+
+            # ── Echo gate: discard all audio while Reachy is speaking ────────
+            if speaking_guard is not None and getattr(speaking_guard, "is_active", False):
+                # Reset VAD state so any partial detection is discarded
+                chunks.clear()
+                speech_chunks  = 0
+                silence_chunks = 0
+                speech_started = False
+                time.sleep(0.05)
+                continue
 
             chunk = chunk_fn()
             if chunk is None or len(chunk) == 0:

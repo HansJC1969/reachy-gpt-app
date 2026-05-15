@@ -292,7 +292,7 @@ class ConversationManager:
         5. Return (final text reply, Emotion).
         """
         messages = self._build_messages(user_input, history_override)
-        tools = self._active_tools()
+        tools = self._active_tools(user_input)
         emotion = Emotion.NEUTRAL
         reply = ""
 
@@ -429,7 +429,7 @@ class ConversationManager:
           self.last_reply    — full concatenated reply (for memory / logging)
         """
         messages = self._build_messages(user_input, history_override)
-        tools = self._active_tools()
+        tools = self._active_tools(user_input)
         self.last_emotion = Emotion.NEUTRAL
         self.last_reply = ""
         reply_parts: list[str] = []
@@ -607,8 +607,26 @@ class ConversationManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _active_tools(self) -> list[dict]:
-        """Return the tool list based on which modules are configured."""
+    # Vision is offered to GPT only when the user's message contains an explicit
+    # question about what Reachy can see.  This prevents proactive tool calls
+    # that would inject camera output into unrelated conversations.
+    _VISION_TRIGGERS: frozenset[str] = frozenset({
+        "siehst du", "was siehst", "kannst du sehen", "was ist zu sehen",
+        "schau mal", "schau dir", "wer ist im raum",
+        "what do you see", "what can you see", "look at",
+        "who is in the room", "describe what", "kamera", "camera",
+    })
+
+    def _user_asks_vision(self, text: str) -> bool:
+        t = text.lower()
+        return any(trigger in t for trigger in self._VISION_TRIGGERS)
+
+    def _active_tools(self, user_input: str = "") -> list[dict]:
+        """Return the tool list for this turn.
+
+        The vision tool is included only when the user's message contains an
+        explicit vision question — never offered proactively.
+        """
         tools = [_EMOTION_TOOL]
         if self._searcher:
             tools.append(_SEARCH_TOOL)
@@ -616,7 +634,7 @@ class ConversationManager:
             tools.append(_MOVE_HEAD_TOOL)
         if self._dance_fn:
             tools.append(_DANCE_TOOL)
-        if self._vision:
+        if self._vision and self._user_asks_vision(user_input):
             tools.append(_VISION_TOOL)
         return tools
 

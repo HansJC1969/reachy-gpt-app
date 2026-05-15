@@ -219,7 +219,14 @@ class SpeechEngine:
 
     @property
     def is_speaking(self) -> bool:
+        """True while an utterance is actively playing audio."""
         return self._speaking.is_set()
+
+    @property
+    def is_active(self) -> bool:
+        """True while any speech is queued OR currently playing.
+        Use this as a speaking guard for echo cancellation."""
+        return not self._queue.empty() or self._speaking.is_set()
 
     def speak(self, text: str, *, interrupt: bool = False) -> None:
         """
