@@ -105,10 +105,12 @@ _VISION_TOOL: dict = {
     "function": {
         "name": "get_visual_description",
         "description": (
-            "Look through the robot's camera and describe what is physically visible. "
-            "Use ONLY when the person asks what you see, who is in the room, or when "
-            "the scene context would help. Do NOT use for prices, weather, news, "
-            "cryptocurrency, stocks, or any internet-based information."
+            "Look through the robot's camera and describe what is visible. "
+            "Call this tool ONLY when the person explicitly asks a question about "
+            "what you can see — e.g. 'Was siehst du?', 'Who is in the room?', "
+            "'What does it look like?'. "
+            "Do NOT call this tool on your own initiative, for web queries, or "
+            "when no visual question was asked."
         ),
         "parameters": {
             "type": "object",

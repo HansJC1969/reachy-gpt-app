@@ -2,18 +2,19 @@
 Real-time face tracking using OpenCV Haar cascade.
 Moves Reachy Mini's head to follow the detected face using look_at_image(),
 which delegates inverse kinematics to the SDK.
-Rotates the body yaw when the face is >40% off-centre horizontally.
+Rotates the body yaw when the face is >50% off-centre horizontally.
 
-Smooth tracking design
-----------------------
-• EMA low-pass filter (α=0.30) on raw detection coordinates to suppress jitter.
-• Dead zone: no command sent when the face is within 15% of centre in both axes.
-• Move threshold: only command when smoothed position changed ≥5% of frame.
-• Cooldown: minimum 1.5 s between head commands so each motion can complete.
-• look_at_image(duration=1.5) → minjerk interpolation, no snapping.
-• 80% position clamp: face coords clamped to ±80% of frame half-width/height
-  before passing to look_at_image, keeping head well within physical limits
-  (80% × 40° = ±32° effective pitch/roll range).
+Safe-speed tracking design (all limits from AGENTS.md)
+-------------------------------------------------------
+• EMA low-pass filter (α=0.20) — heavy smoothing to suppress jitter.
+• Dead zone 20%: no command when face is within 20% of centre in both axes.
+• Move threshold 8%: only command when smoothed position changed ≥8% of frame.
+• Cooldown 1.0 s between head commands so each motion finishes before the next.
+• look_at_image(duration=1.0) → 1-second smooth interpolation.
+• Position clamp 20%: face coords clamped to ±20% of frame half-width/height
+  before IK — limits effective head angle to ~20% of physical limit
+  (20% × 40° ≈ ±8° effective pitch/roll, 20% × 180° ≈ ±36° yaw).
+• Body rotation: 3° step, 2 s cooldown, triggers at >50% horizontal offset.
 
 SDK: reachy_mini (ReachyMini)
   reachy.look_at_image(u, v, duration)      — smooth pixel-based head pointing
@@ -25,7 +26,6 @@ Joint limits (from AGENTS.md — SDK clamps automatically):
   Head yaw          : ±180°
   Body yaw          : ±160°
   Head-body delta   : max 65°
-  This module targets 80% of those limits via POSITION_CLAMP.
 
 Can be tested without a robot:
     python -m modules.face_tracking --no-robot
@@ -54,17 +54,17 @@ _CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 BODY_YAW_MIN = math.radians(-160.0)
 BODY_YAW_MAX = math.radians( 160.0)
 
-# How much to increment absolute body yaw per rotation command
-BODY_ROTATION_STEP = math.radians(5.0)
+# Increment absolute body yaw per rotation command (safe: 3° per step)
+BODY_ROTATION_STEP = math.radians(3.0)
 
-# Body rotation triggers when smoothed face is >40% off horizontal centre
-BODY_ROTATION_THRESHOLD = 0.40
+# Body rotation triggers when smoothed face is >50% off horizontal centre
+BODY_ROTATION_THRESHOLD = 0.50
 
 # Minimum seconds between body-rotation commands
-BODY_ROTATION_COOLDOWN = 1.0
+BODY_ROTATION_COOLDOWN = 2.0
 
 # ---------------------------------------------------------------------------
-# Head tracking parameters
+# Head tracking parameters  (safe limits: 20% of physical maximum)
 # ---------------------------------------------------------------------------
 
 # Haar detection minimum face size (px)
@@ -72,25 +72,25 @@ _SCALE_FACTOR   = 1.1
 _MIN_NEIGHBOURS = 5
 MIN_FACE_PX     = 60
 
-# EMA low-pass filter weight for face position (lower α → smoother / more lag)
-EMA_ALPHA = 0.30
+# EMA low-pass filter weight (lower α → smoother, more lag; 0.20 = heavy smoothing)
+EMA_ALPHA = 0.20
 
-# Normalised dead zone: face inside this box around centre → no head movement
-DEAD_ZONE = 0.15          # fraction of half-frame width/height
+# Dead zone 20%: face inside this box around centre → no head movement
+DEAD_ZONE = 0.20          # fraction of half-frame width/height
 
 # Minimum change (normalised) from last commanded position to trigger a move
-MOVE_THRESHOLD = 0.05     # 5% of frame
+MOVE_THRESHOLD = 0.08     # 8% of frame
 
-# Clamp face position to ±80% of half-frame before IK (keeps head within
-# ~80% of physical limits without computing explicit joint angles)
-POSITION_CLAMP = 0.80
+# Clamp face position to ±20% of half-frame before IK.
+# Limits effective head angle to ~20% of physical maximum:
+#   pitch/roll: 20% × 40° ≈ ±8°   yaw: 20% × 180° ≈ ±36°
+POSITION_CLAMP = 0.20
 
-# Duration of each smooth look_at_image / goto_target motion (seconds)
-LOOK_DURATION = 1.5
+# 1-second smooth interpolation per SDK motion command
+LOOK_DURATION = 1.0
 
-# Minimum gap between successive head commands (seconds)
-# Must be >= LOOK_DURATION so motions don't pile up
-LOOK_COOLDOWN = 1.5
+# Minimum gap between successive head commands (must be ≥ LOOK_DURATION)
+LOOK_COOLDOWN = 1.0
 
 
 @dataclass
