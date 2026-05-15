@@ -584,6 +584,7 @@ def main() -> None:
         try:
             stt = SpeechToText(reachy=reachy)
             logger.info("STT enabled (%s)", "Reachy mic" if reachy is not None else "system mic")
+            stt.mic_selftest()
         except Exception:
             logger.warning("STT disabled (check OPENAI_API_KEY or sounddevice installation)")
 

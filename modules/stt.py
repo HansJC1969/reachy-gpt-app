@@ -5,7 +5,8 @@ Audio capture
 -------------
 On robot (reachy is not None):
     reachy.media.start_recording() / get_audio_sample() / stop_recording()
-    SDK LOCAL backend — GStreamer audio IPC, 16 kHz float32 stereo.
+    SDK LOCAL backend — GStreamer pipeline sourced from reachymini_audio_src,
+    delivering 16 kHz float32 stereo frames via IPC.
 
     Voice activity detection uses reachy.media.get_DoA() which returns
     (angle, is_speech_detected).  DoA is treated as an OR signal: speech is
@@ -22,8 +23,13 @@ Both paths share _vad_loop():
      quiet have elapsed.
   3. Stop recording after MAX_RECORD_DURATION (10 s) to prevent runaway capture.
   4. Discard if speech content < MIN_SPEECH_DURATION (0.5 s).
-  4. Send WAV bytes to OpenAI Whisper-1 with language=WHISPER_LANGUAGE
+  5. Send WAV bytes to OpenAI Whisper-1 with language=WHISPER_LANGUAGE
      ("de" by default) to prevent language-guessing misreads.
+
+Startup test:
+    Call stt.mic_selftest() after construction to record 3 s of ambient audio
+    and print the RMS level — use this to verify the mic is working and to
+    tune STT_THRESHOLD in .env.
 
 Standalone test:
     python -m modules.stt
@@ -55,9 +61,10 @@ SAMPLE_RATE   = 16_000          # Hz — matches Reachy Mini SDK output
 CHUNK_SAMPLES = 1_600           # 0.1 s per VAD chunk
 
 # RMS energy threshold for speech onset/offset.
-# 0.005 works at ~0.5–1 m conversational distance with Reachy's mic array.
-# Raise if background noise is being picked up; lower if speech isn't detected.
-SPEECH_THRESHOLD = float(os.environ.get("STT_THRESHOLD", "0.005"))
+# 0.020 works at ~0.5–1 m conversational distance with Reachy's mic array.
+# Raise if background noise triggers false detection; lower if speech is missed.
+# Override with STT_THRESHOLD in .env (run mic_selftest() to find your level).
+SPEECH_THRESHOLD = float(os.environ.get("STT_THRESHOLD", "0.020"))
 
 # Seconds of consecutive silence that ends a recording
 SILENCE_DURATION  = 0.8
@@ -102,6 +109,67 @@ class SpeechToText:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def mic_selftest(self, duration: float = 3.0) -> float:
+        """
+        Record *duration* seconds of audio and print the RMS level.
+
+        Use at startup to verify the microphone is working and to help tune
+        STT_THRESHOLD in .env.  Returns the measured RMS (0.0 on failure).
+        """
+        print(f"\n🎙️  Mikrofon-Selbsttest ({duration:.0f}s) — bitte sprechen …", flush=True)
+        chunks: list[np.ndarray] = []
+
+        if self._reachy is not None:
+            try:
+                self._reachy.media.start_recording()
+                # Allow the reachymini_audio_src GStreamer pipeline to stabilise
+                time.sleep(0.3)
+                deadline = time.monotonic() + duration
+                while time.monotonic() < deadline:
+                    chunk = self._sdk_chunk()
+                    if chunk is not None and len(chunk) > 0:
+                        chunks.append(chunk)
+            except Exception:
+                logger.exception("Mikrofon-Selbsttest fehlgeschlagen")
+            finally:
+                try:
+                    self._reachy.media.stop_recording()
+                except Exception:
+                    pass
+        else:
+            try:
+                import sounddevice as sd  # type: ignore
+                data = sd.rec(
+                    int(duration * SAMPLE_RATE),
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype="float32",
+                )
+                sd.wait()
+                chunks = [data[:, 0]]
+            except Exception:
+                logger.exception("Mikrofon-Selbsttest fehlgeschlagen (sounddevice)")
+
+        if not chunks:
+            print("  ❌ Kein Audio empfangen — Mikrofon prüfen!", flush=True)
+            return 0.0
+
+        audio = np.concatenate(chunks)
+        rms   = float(np.sqrt(np.mean(audio ** 2)))
+        peak  = float(np.max(np.abs(audio)))
+
+        bar_filled = int(min(rms / 0.1, 1.0) * 20)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+        if rms >= SPEECH_THRESHOLD:
+            status = "✅ OK"
+        else:
+            status = f"⚠️  SEHR LEISE — STT_THRESHOLD ggf. auf {rms * 0.7:.4f} senken"
+
+        print(f"  RMS: {rms:.4f}  Peak: {peak:.4f}  [{bar}]  {status}", flush=True)
+        print(f"  Schwellwert aktuell: STT_THRESHOLD={SPEECH_THRESHOLD:.4f}", flush=True)
+        return rms
+
     def listen_and_transcribe(
         self,
         timeout: float = MAX_DURATION,
@@ -139,8 +207,8 @@ class SpeechToText:
             logger.exception("media.start_recording() failed")
             return None
 
-        # Brief warmup so the GStreamer pipeline is ready before VAD starts
-        time.sleep(0.15)
+        # Allow the reachymini_audio_src GStreamer pipeline to stabilise
+        time.sleep(0.3)
 
         try:
             return self._vad_loop(
@@ -250,7 +318,7 @@ class SpeechToText:
         speech_started = False
         deadline       = time.monotonic() + timeout
 
-        print("  [warte auf Sprache…]", flush=True)
+        print("🎤 Ich höre zu...", flush=True)
 
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -273,7 +341,7 @@ class SpeechToText:
                     speech_started = True
                     logger.info("STT: Sprache erkannt (rms=%.4f, threshold=%.4f)",
                                 rms, SPEECH_THRESHOLD)
-                    print("  [Sprache erkannt — aufnehmen…]", flush=True)
+                    print("✅ Sprache erkannt!", flush=True)
                 silence_chunks = 0
                 speech_chunks += 1
                 chunks.append(chunk)
@@ -281,7 +349,7 @@ class SpeechToText:
                 # Hard cap: stop recording after MAX_RECORD_DURATION
                 if speech_chunks >= MAX_RECORD_CHUNKS:
                     logger.info("STT: max Aufnahmedauer erreicht (%.0fs)", MAX_RECORD_DURATION)
-                    print(f"  [Max. {MAX_RECORD_DURATION:.0f}s — sende an Whisper…]", flush=True)
+                    print(f"  ⏱️  Max. {MAX_RECORD_DURATION:.0f}s — sende an Whisper…", flush=True)
                     break
 
             elif speech_started:
@@ -289,7 +357,7 @@ class SpeechToText:
                 chunks.append(chunk)
                 if silence_chunks >= SILENCE_CHUNKS:
                     speech_secs = speech_chunks * CHUNK_SAMPLES / SAMPLE_RATE
-                    print(f"  [Aufnahme beendet ({speech_secs:.1f}s) — transkribiere…]",
+                    print(f"  🔄 Aufnahme beendet ({speech_secs:.1f}s) — transkribiere…",
                           flush=True)
                     break
 
