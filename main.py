@@ -52,7 +52,7 @@ logger = logging.getLogger("main")
 # Local modules
 # ---------------------------------------------------------------------------
 from modules.conversation import ConversationManager
-from modules.emotions import Emotion, EmotionEngine
+from modules.emotions import Emotion, EmotionEngine, SLEEP_POSE
 from modules.face_tracking import FaceTracker, FacePosition
 from modules.face_recognition_module import FaceRecognitionModule
 from modules.memory import (
@@ -270,6 +270,14 @@ def _is_stop_command(text: str) -> bool:
     return bool(_STOP_RE.search(text.strip()))
 
 
+_WAKE_WORDS = frozenset({"reachy", "wache auf", "wach auf", "aufwachen", "wake up"})
+
+def _is_wake_word(text: str) -> bool:
+    """Return True when *text* contains a wake word that ends sleep mode."""
+    t = text.lower().strip()
+    return any(w in t for w in _WAKE_WORDS)
+
+
 # ---------------------------------------------------------------------------
 # Thread: conversation  stdin → GPT → stdout + emotion
 # ---------------------------------------------------------------------------
@@ -352,12 +360,45 @@ def conversation_loop(
             emotions.play(Emotion.NEUTRAL)
             continue
 
-        # Sleep command — play MÜDE animation and keep listening
+        # Sleep command — droop to sleep pose, hold until wake word
         if user_input.lower() in {"schlafe", "schlaf", "sleep"}:
             logger.info("Sleep command: %r", user_input)
             if speech:
                 speech.stop()
-            emotions.play(Emotion.MÜDE, block=True)
+            # Droop animation runs in calling thread (~6 s), then holds pose
+            emotions.sleep_mode()
+            print("💤 Reachy schläft — sag 'Reachy', 'wache auf' oder 'wake up'", flush=True)
+
+            # Sleep loop: ignore everything except wake words
+            while not state.stop_event.is_set():
+                if stt is not None:
+                    if speech:
+                        speech.wait_until_done(timeout=5.0)
+                    try:
+                        wake_input = stt.listen_and_transcribe(
+                            timeout=30.0, stop_event=state.stop_event
+                        )
+                    except KeyboardInterrupt:
+                        state.stop_event.set()
+                        break
+                    if state.stop_event.is_set():
+                        break
+                    if wake_input is None:
+                        continue
+                else:
+                    try:
+                        wake_input = input("💤 (schläft) > ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        state.stop_event.set()
+                        break
+
+                if _is_wake_word(wake_input):
+                    logger.info("Wake word detected: %r", wake_input)
+                    emotions.play(Emotion.FREUDE)
+                    if speech:
+                        speech.speak("Ich bin wieder da!", interrupt=True)
+                    break
+
             continue
 
         if user_input.lower() in {"quit", "exit", ":q", "tschüss", "auf wiedersehen"}:

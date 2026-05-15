@@ -136,6 +136,17 @@ def interpolate(kfs: list[Keyframe], t: float) -> Keyframe:
 
 NEUTRAL_POSE = Keyframe(t=0.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)
 
+# Final resting pose used by sleep_mode() — head drooped, antennas down
+SLEEP_POSE = Keyframe(t=0.0, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38)
+
+# Smooth droop animation for entering sleep (no jerk-awake, no glide back)
+_DROOP_TO_SLEEP = Animation(keyframes=[
+    Keyframe(t=0.0, pitch=0,   yaw=0, roll=0,  l_ant=0,   r_ant=0),
+    Keyframe(t=2.0, pitch=-8,  yaw=0, roll=10, l_ant=-15, r_ant=-15),
+    Keyframe(t=4.5, pitch=-16, yaw=0, roll=18, l_ant=-32, r_ant=-32),
+    Keyframe(t=6.0, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38),
+])
+
 ANIMATIONS: dict[Emotion, Animation] = {
 
     Emotion.NEUTRAL: Animation(keyframes=[
@@ -351,6 +362,42 @@ class EmotionEngine:
         self._apply(NEUTRAL_POSE)
         self._set_emotion(Emotion.NEUTRAL)
 
+    def sleep_mode(self) -> None:
+        """
+        Slowly droop head and antennas to sleep pose (blocks ~6 s in the
+        calling thread), then hold the pose in background until play() or
+        stop() is called.  Use with a wake-word listen loop in the caller.
+        """
+        self._cancel()
+        self._stop_evt.clear()
+        self._set_emotion(Emotion.MÜDE)
+        logger.info("[emotion] entering sleep mode")
+
+        # Run the droop in-thread so the caller can await it naturally
+        t_start = time.monotonic()
+        duration = _DROOP_TO_SLEEP.keyframes[-1].t
+        while not self._stop_evt.is_set():
+            elapsed = time.monotonic() - t_start
+            if elapsed >= duration:
+                break
+            self._apply(interpolate(_DROOP_TO_SLEEP.keyframes, elapsed))
+            time.sleep(TICK)
+
+        if self._stop_evt.is_set():
+            return
+
+        # Snap to exact sleep pose, then keep refreshing it in background
+        self._apply(SLEEP_POSE)
+        self._stop_evt.clear()
+        self._thread = threading.Thread(
+            target=self._hold_static,
+            args=(SLEEP_POSE,),
+            daemon=True,
+            name="emotion-sleep-hold",
+        )
+        self._thread.start()
+        logger.info("[emotion] sleep pose held")
+
     def idle(self) -> None:
         """Return gently to neutral (used when no face is detected)."""
         if self.current_emotion != Emotion.NEUTRAL:
@@ -378,6 +425,12 @@ class EmotionEngine:
     # ------------------------------------------------------------------
     # Animation runner
     # ------------------------------------------------------------------
+
+    def _hold_static(self, pose: Keyframe) -> None:
+        """Refresh a single static pose at ~5 Hz until _stop_evt is set."""
+        while not self._stop_evt.is_set():
+            self._apply(pose)
+            time.sleep(TICK * 5)
 
     def _cancel(self) -> None:
         self._stop_evt.set()
