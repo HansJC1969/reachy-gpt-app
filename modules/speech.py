@@ -367,27 +367,46 @@ class SpeechEngine:
             self._play_sounddevice(audio)
 
     def _play_sdk(self, audio: np.ndarray) -> None:
-        """Play via Reachy Mini SDK GStreamer backend (push_audio_sample)."""
-        # Convert int16 → float32 normalised [-1, 1], resample 24 kHz → 16 kHz
+        """Play via Reachy Mini SDK GStreamer backend (push_audio_sample).
+
+        SDK audio spec (from reachy_mini/media/audio_base.py):
+          - dtype  : float32
+          - shape  : (num_samples, 2)  — stereo interleaved
+          - rate   : 16 000 Hz
+          - range  : [-1.0, +1.0]
+
+        push_audio_sample() is non-blocking — it pushes a timestamped
+        GStreamer buffer into the appsrc and returns immediately.  We pace
+        the pushes with time.sleep() so the GStreamer queue never starves
+        or overflows.
+        """
+        # int16 → float32 [-1, 1], resample 24 kHz → 16 kHz
         audio_f32 = audio.astype(np.float32) / 32768.0
         audio_f32 = _resample(audio_f32, SAMPLE_RATE, _SDK_RATE)
-        # SDK expects (samples, channels) float32
-        audio_out = audio_f32.reshape(-1, 1)
+
+        # SDK GStreamer pipeline expects stereo (num_samples, 2).
+        # Duplicate the mono channel so both channels carry the same signal.
+        audio_stereo = np.column_stack([audio_f32, audio_f32])
 
         try:
             self._reachy.media.start_playing()
-            # Brief warmup so the GStreamer pipeline is ready before first push
-            time.sleep(0.05)
-            for start in range(0, len(audio_out), _SDK_CHUNK_SIZE):
+            # Allow the GStreamer appsrc pipeline to initialise before first push
+            time.sleep(0.1)
+
+            for start in range(0, len(audio_stereo), _SDK_CHUNK_SIZE):
                 if self._stop_evt.is_set():
-                    break
-                chunk = audio_out[start : start + _SDK_CHUNK_SIZE]
+                    # Flush the GStreamer buffer immediately
+                    try:
+                        self._reachy.media.clear_player()
+                    except Exception:
+                        pass
+                    return
+                chunk = audio_stereo[start : start + _SDK_CHUNK_SIZE]
                 self._reachy.media.push_audio_sample(chunk)
-                # push_audio_sample is async — pace pushes to match playback speed
+                # Sleep to pace pushes at real-time playback speed
                 time.sleep(len(chunk) / _SDK_RATE)
             else:
-                # GStreamer buffers one chunk internally; wait for it to drain
-                # before calling stop_playing(), otherwise the last chunk is cut off
+                # GStreamer buffers the last chunk — wait for it to drain
                 time.sleep(_SDK_CHUNK_SIZE / _SDK_RATE)
         except Exception:
             logger.exception("SDK audio playback failed")
