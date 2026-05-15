@@ -226,20 +226,29 @@ class SpeechToText:
         """
         Block until speech is detected, record until silence, return transcript.
 
-        Echo cancellation: if a speaking_event was passed to __init__(), this
-        method spin-waits at the entry point until the event is clear before
-        opening the microphone.  The _vad_loop also checks it continuously so
-        no audio is ever recorded while Reachy is speaking.
+        Echo cancellation:
+          1. Entry gate — spin-waits until the shared mute event clears
+             (set by SpeechEngine while TTS is playing; cleared 2 s after
+             the last utterance finishes so physical echo has time to decay).
+          2. Buffer flush — if TTS was active, reads and discards 0.3 s of
+             mic audio to clear any residual hardware-buffer content before
+             real VAD begins.
 
         Returns the stripped transcript string, or None if timed out,
         stop_event was set, no speech was detected, or transcription failed.
         """
-        # ── Entry-point mute gate ─────────────────────────────────────────────
+        # ── Entry-point mute gate + post-TTS buffer flush ─────────────────────
         if self._mute_event is not None:
+            tts_was_active = False
             while self._mute_event.is_set():
+                tts_was_active = True
                 if stop_event is not None and stop_event.is_set():
                     return None
                 time.sleep(0.1)
+            if tts_was_active:
+                # TTS just finished (including 2 s settle delay in SpeechEngine).
+                # Flush hardware mic buffer to discard any residual echo bytes.
+                self._flush_mic_buffer()
 
         if self._reachy is not None:
             audio = self._record_sdk(timeout, stop_event)
@@ -253,6 +262,31 @@ class SpeechToText:
         logger.info("STT: %.1f s aufgenommen — sende an Whisper (language=%s)",
                     duration, WHISPER_LANGUAGE)
         return self._transcribe(audio)
+
+    # ── Post-TTS mic flush ────────────────────────────────────────────────────
+
+    def _flush_mic_buffer(self, duration: float = 0.3) -> None:
+        """Read and discard *duration* seconds of mic audio.
+
+        Called after the TTS mute gate clears to purge any bytes that
+        accumulated in the hardware buffer during the echo-settle window.
+        """
+        logger.debug("STT: flushing mic buffer (%.1f s)", duration)
+        if self._reachy is not None:
+            try:
+                self._reachy.media.start_recording()
+                deadline = time.monotonic() + duration
+                while time.monotonic() < deadline:
+                    self._sdk_chunk()   # read and discard
+            except Exception:
+                logger.debug("mic flush error", exc_info=True)
+            finally:
+                try:
+                    self._reachy.media.stop_recording()
+                except Exception:
+                    pass
+        # sounddevice: each listen session opens a fresh InputStream — no
+        # pre-buffered audio, so no flush needed for that path.
 
     # ── SDK audio path ────────────────────────────────────────────────────────
 
@@ -371,9 +405,9 @@ class SpeechToText:
         Speech detection (sounddevice path):
           RMS >= threshold only.
 
-        Echo cancellation:
-          When self._mute_event is set, all chunks are discarded and VAD state
-          is reset — prevents Reachy's own voice from triggering STT.
+        Echo cancellation is handled at the listen_and_transcribe() entry point
+        (mute gate + 0.3 s hardware buffer flush), so by the time _vad_loop
+        runs, the mic is clean and no mid-loop muting is needed.
         """
         chunks:        list[np.ndarray] = []
         speech_chunks  = 0
@@ -386,15 +420,6 @@ class SpeechToText:
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return None
-
-            # ── Echo gate: no recording while Reachy is speaking ─────────────
-            if self._mute_event is not None and self._mute_event.is_set():
-                chunks.clear()
-                speech_chunks  = 0
-                silence_chunks = 0
-                speech_started = False
-                time.sleep(0.1)
-                continue
 
             chunk = chunk_fn()
             if chunk is None or len(chunk) == 0:

@@ -86,11 +86,12 @@ MOVE_THRESHOLD = 0.08     # 8% of frame
 #   pitch/roll: 20% × 40° ≈ ±8°   yaw: 20% × 180° ≈ ±36°
 POSITION_CLAMP = 0.20
 
-# 1-second smooth interpolation per SDK motion command
-LOOK_DURATION = 1.0
+# Smooth interpolation per SDK motion command.
+# SDK goto_target / look_at_image require duration in [0, 1) — use 0.8 for margin.
+LOOK_DURATION = 0.8
 
 # Minimum gap between successive head commands (must be ≥ LOOK_DURATION)
-LOOK_COOLDOWN = 1.0
+LOOK_COOLDOWN = 0.8
 
 
 @dataclass
@@ -247,7 +248,7 @@ class FaceTracker:
                 self.reachy.goto_target(
                     head=create_head_pose(yaw=0, pitch=0, degrees=True),
                     body_yaw=0.0,
-                    duration=0.5,
+                    duration=0.8,
                 )
             except Exception:
                 logger.warning("Could not centre head", exc_info=True)

@@ -278,6 +278,12 @@ def _is_stop_command(text: str) -> bool:
     return bool(_STOP_RE.search(text.strip()))
 
 
+_SLEEP_PHRASES: frozenset[str] = frozenset({
+    "schlafe", "schlaf", "sleep",
+    "go to sleep", "gute nacht", "guten nacht",
+    "geh schlafen", "mach eine pause",
+})
+
 _WAKE_WORDS = frozenset({"reachy", "wache auf", "wach auf", "aufwachen", "wake up"})
 
 def _is_wake_word(text: str) -> bool:
@@ -390,7 +396,7 @@ def conversation_loop(
             continue
 
         # Sleep command — droop to sleep pose, hold until wake word
-        if user_input.lower() in {"schlafe", "schlaf", "sleep"}:
+        if user_input.lower().strip() in _SLEEP_PHRASES:
             logger.info("Sleep command: %r", user_input)
             if speech:
                 speech.stop()

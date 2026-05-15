@@ -286,11 +286,16 @@ class SpeechEngine:
                 break
 
     def _delayed_unmute(self) -> None:
-        """Clear the shared mute event 1.5 s after TTS finishes, if still idle."""
-        time.sleep(1.5)
+        """Clear the shared mute event 2.0 s after TTS finishes, if still idle.
+
+        The 2-second pause lets any speaker echo dissipate physically before
+        the microphone starts recording again.  STT then does a short hardware
+        buffer flush on top of this to clear any residual buffered audio.
+        """
+        time.sleep(2.0)
         if self._mute_event is not None and self._queue.empty() and not self._speaking.is_set():
             self._mute_event.clear()
-            logger.debug("Mic unmuted (1.5 s post-TTS settle)")
+            logger.debug("Mic unmuted (2.0 s post-TTS echo settle)")
 
     def _worker(self) -> None:
         """Background thread: pull text from queue → synthesize → play."""
