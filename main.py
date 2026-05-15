@@ -352,6 +352,14 @@ def conversation_loop(
             emotions.play(Emotion.NEUTRAL)
             continue
 
+        # Sleep command — play MÜDE animation and keep listening
+        if user_input.lower() in {"schlafe", "schlaf", "sleep"}:
+            logger.info("Sleep command: %r", user_input)
+            if speech:
+                speech.stop()
+            emotions.play(Emotion.MÜDE, block=True)
+            continue
+
         if user_input.lower() in {"quit", "exit", ":q", "tschüss", "auf wiedersehen"}:
             if speech:
                 speech.speak("Tschüss! Bis zum nächsten Mal.", interrupt=True)
@@ -610,6 +618,9 @@ def main() -> None:
     logger.info("Starting %d threads…", len(threads))
     for t in threads:
         t.start()
+
+    # Show startup joy — Reachy wakes up happy
+    emotions.play(Emotion.FREUDE)
 
     try:
         # Wait for the conversation thread (the only non-daemon thread)
