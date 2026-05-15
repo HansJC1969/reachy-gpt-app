@@ -329,6 +329,7 @@ class SpeechToText:
                 file=("speech.wav", wav, "audio/wav"),
                 response_format="text",
                 language=WHISPER_LANGUAGE,
+                prompt="Reachy, Hans",
             )
             text = result.strip() if isinstance(result, str) else str(result).strip()
             logger.debug("STT transcript: %r", text[:120])

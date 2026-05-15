@@ -347,6 +347,8 @@ class SpeechEngine:
 
         try:
             self._reachy.media.start_playing()
+            # Brief warmup so the GStreamer pipeline is ready before first push
+            time.sleep(0.05)
             for start in range(0, len(audio_out), _SDK_CHUNK_SIZE):
                 if self._stop_evt.is_set():
                     break
@@ -354,6 +356,10 @@ class SpeechEngine:
                 self._reachy.media.push_audio_sample(chunk)
                 # push_audio_sample is async — pace pushes to match playback speed
                 time.sleep(len(chunk) / _SDK_RATE)
+            else:
+                # GStreamer buffers one chunk internally; wait for it to drain
+                # before calling stop_playing(), otherwise the last chunk is cut off
+                time.sleep(_SDK_CHUNK_SIZE / _SDK_RATE)
         except Exception:
             logger.exception("SDK audio playback failed")
         finally:
