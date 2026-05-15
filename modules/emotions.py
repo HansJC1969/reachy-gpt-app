@@ -76,12 +76,13 @@ def parse_emotion(label: str) -> Emotion:
 @dataclass
 class Keyframe:
     """A single pose snapshot in an animation."""
-    t:      float   # time offset in seconds from animation start
-    pitch:  float   # neck pitch  (°) — positive = head up
-    yaw:    float   # neck yaw    (°) — positive = head right
-    roll:   float   # neck roll   (°) — positive = tilt right
-    l_ant:  float   # left  antenna (°)
-    r_ant:  float   # right antenna (°)
+    t:        float   # time offset in seconds from animation start
+    pitch:    float   # neck pitch    (°) — positive = head up
+    yaw:      float   # neck yaw      (°) — positive = head right
+    roll:     float   # neck roll     (°) — positive = tilt right
+    l_ant:    float   # left  antenna (°)
+    r_ant:    float   # right antenna (°)
+    body_yaw: float = 0.0  # body rotation (°) — positive = rotate right; ±160° limit
 
 
 @dataclass
@@ -111,11 +112,12 @@ def interpolate(kfs: list[Keyframe], t: float) -> Keyframe:
             alpha = (t - k0.t) / span if span > 0 else 1.0
             return Keyframe(
                 t=t,
-                pitch=_coslerp(k0.pitch, k1.pitch, alpha),
-                yaw=  _coslerp(k0.yaw,   k1.yaw,   alpha),
-                roll= _coslerp(k0.roll,  k1.roll,  alpha),
-                l_ant=_coslerp(k0.l_ant, k1.l_ant, alpha),
-                r_ant=_coslerp(k0.r_ant, k1.r_ant, alpha),
+                pitch=   _coslerp(k0.pitch,    k1.pitch,    alpha),
+                yaw=     _coslerp(k0.yaw,       k1.yaw,      alpha),
+                roll=    _coslerp(k0.roll,      k1.roll,     alpha),
+                l_ant=   _coslerp(k0.l_ant,     k1.l_ant,    alpha),
+                r_ant=   _coslerp(k0.r_ant,     k1.r_ant,    alpha),
+                body_yaw=_coslerp(k0.body_yaw,  k1.body_yaw, alpha),
             )
     return kfs[-1]
 
@@ -227,13 +229,22 @@ ANIMATIONS: dict[Emotion, Animation] = {
     ]),
 
     # -----------------------------------------------------------------------
-    # TANZEN — rhythmic left/right head swings, antennas counter-sway
+    # TANZEN — slow graceful sway: head left/right, antennas counter-sway,
+    # body rotates gently with each beat.
+    # Period 3.0 s × 4 loops ≈ 12 s total.
+    # All values well within safe limits (head yaw ±20° of ±180°,
+    # body yaw ±8° of ±160°, head–body delta ≤ 28° of 65° limit).
     Emotion.TANZEN: Animation(loop=True, loop_count=4, keyframes=[
-        Keyframe(t=0.0, pitch=4,  yaw=0,   roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=0.3, pitch=6,  yaw=18,  roll=12,  l_ant=40,  r_ant=-15),
-        Keyframe(t=0.6, pitch=4,  yaw=0,   roll=0,   l_ant=10,  r_ant=10),
-        Keyframe(t=0.9, pitch=6,  yaw=-18, roll=-12, l_ant=-15, r_ant=40),
-        Keyframe(t=1.2, pitch=4,  yaw=0,   roll=0,   l_ant=10,  r_ant=10),
+        # centre — ready
+        Keyframe(t=0.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
+        # sway RIGHT — head right, left antenna up, right antenna dips, body right
+        Keyframe(t=0.75, pitch=5, yaw=20,  roll=12,  l_ant=45,  r_ant=-10, body_yaw= 8.0),
+        # return to centre
+        Keyframe(t=1.5,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
+        # sway LEFT — head left, right antenna up, left antenna dips, body left
+        Keyframe(t=2.25, pitch=5, yaw=-20, roll=-12, l_ant=-10, r_ant=45,  body_yaw=-8.0),
+        # return to centre
+        Keyframe(t=3.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
     ]),
 
     # -----------------------------------------------------------------------
@@ -442,6 +453,7 @@ class EmotionEngine:
                 logger.debug("_cancel: animation thread did not stop within timeout")
 
     def _run(self, anim: Animation) -> None:
+        uses_body = any(abs(kf.body_yaw) >= 0.1 for kf in anim.keyframes)
         repeats = 0
         max_repeats = anim.loop_count if (anim.loop and anim.loop_count > 0) else (999 if anim.loop else 1)
         duration = anim.keyframes[-1].t
@@ -453,16 +465,18 @@ class EmotionEngine:
                 if elapsed >= duration:
                     break
                 pose = interpolate(anim.keyframes, elapsed)
-                self._apply(pose)
+                self._apply(pose, send_body=uses_body)
                 time.sleep(TICK)
 
             # Hold the final frame for one tick before looping/ending
             if not self._stop_evt.is_set():
-                self._apply(anim.keyframes[-1])
+                self._apply(anim.keyframes[-1], send_body=uses_body)
             repeats += 1
 
         # Always glide back to neutral when done (unless interrupted externally)
         if not self._stop_evt.is_set():
+            if uses_body:
+                self._reset_body_yaw(duration=0.8)
             self._glide_to_neutral(duration=0.8)
             self._set_emotion(Emotion.NEUTRAL)
 
@@ -487,13 +501,17 @@ class EmotionEngine:
     # Hardware interface
     # ------------------------------------------------------------------
 
-    def _apply(self, pose: Keyframe) -> None:
-        """Send *pose* to the robot, or log it in sim mode."""
+    def _apply(self, pose: Keyframe, *, send_body: bool = False) -> None:
+        """Send *pose* to the robot, or log it in sim mode.
+
+        send_body — when True, also command body_yaw (used by animations
+        that explicitly animate the body, e.g. TANZEN).
+        """
         if self.reachy is None:
             logger.debug(
                 "[sim] emotion  pitch=%+.1f  yaw=%+.1f  roll=%+.1f  "
-                "l_ant=%+.1f  r_ant=%+.1f",
-                pose.pitch, pose.yaw, pose.roll, pose.l_ant, pose.r_ant,
+                "l_ant=%+.1f  r_ant=%+.1f  body_yaw=%+.1f",
+                pose.pitch, pose.yaw, pose.roll, pose.l_ant, pose.r_ant, pose.body_yaw,
             )
             return
 
@@ -506,7 +524,31 @@ class EmotionEngine:
             antennas = np.deg2rad([pose.r_ant, pose.l_ant])
             self.reachy.set_target(head=head_pose, antennas=antennas)
         except Exception:
-            logger.debug("Motion command failed", exc_info=True)
+            logger.debug("Head/antenna command failed", exc_info=True)
+
+        if send_body:
+            rad = math.radians(pose.body_yaw)
+            try:
+                self.reachy.set_target_body_yaw(rad)
+            except AttributeError:
+                # Older SDK: use goto_target with a very short duration so
+                # the robot tracks our 25 Hz keyframe interpolation closely.
+                try:
+                    self.reachy.goto_target(body_yaw=rad, duration=TICK * 2)
+                except Exception:
+                    logger.debug("Body yaw command failed (goto_target)", exc_info=True)
+            except Exception:
+                logger.debug("Body yaw command failed", exc_info=True)
+
+    def _reset_body_yaw(self, duration: float = 0.8) -> None:
+        """Smoothly return body to yaw=0 using SDK interpolation (non-blocking)."""
+        if self.reachy is None:
+            logger.debug("[sim] body_yaw reset → 0°")
+            return
+        try:
+            self.reachy.goto_target(body_yaw=0.0, duration=duration)
+        except Exception:
+            logger.debug("Body yaw reset failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

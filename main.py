@@ -286,6 +286,18 @@ def _is_wake_word(text: str) -> bool:
     return any(w in t for w in _WAKE_WORDS)
 
 
+_DANCE_RE = re.compile(
+    r"\b(tanz(?:e[nt]?|st|t)?|danc(?:e|ing)|kannst\s+du\s+tanzen|tanz\s+mal"
+    r"|mach\s+(einen\s+)?tanz|beweg\s+dich)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_dance_command(text: str) -> bool:
+    """Return True when *text* is a dance request."""
+    return bool(_DANCE_RE.search(text.strip()))
+
+
 # ---------------------------------------------------------------------------
 # Thread: conversation  stdin → GPT → stdout + emotion
 # ---------------------------------------------------------------------------
@@ -361,6 +373,20 @@ def conversation_loop(
                 speech.stop()
                 speech.speak("OK.", interrupt=True)
             emotions.play(Emotion.NEUTRAL)
+            continue
+
+        # Dance command — speak, pause tracking, perform blocking dance animation
+        if _is_dance_command(user_input):
+            logger.info("Dance command: %r", user_input)
+            if speech:
+                speech.stop()
+                speech.speak("Natürlich kann ich tanzen!", interrupt=True)
+                speech.wait_until_done(timeout=5.0)
+            state.sleeping = True   # reuse sleeping flag to pause face tracking
+            try:
+                emotions.play(Emotion.TANZEN, block=True)
+            finally:
+                state.sleeping = False
             continue
 
         # Sleep command — droop to sleep pose, hold until wake word
