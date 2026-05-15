@@ -92,10 +92,11 @@ class SharedState:
         self.last_face_seen: float = time.monotonic()
         self.sleeping: bool = False   # True while in sleep mode — pauses tracking
 
-        self.frame_lock   = threading.Lock()
-        self.face_lock    = threading.Lock()
-        self.person_lock  = threading.Lock()
-        self.stop_event   = threading.Event()
+        self.frame_lock     = threading.Lock()
+        self.face_lock      = threading.Lock()
+        self.person_lock    = threading.Lock()
+        self.stop_event     = threading.Event()
+        self.speaking_event = threading.Event()  # set while Reachy is speaking (mutes mic)
 
 
 # ---------------------------------------------------------------------------
@@ -323,15 +324,11 @@ def conversation_loop(
                 speech.speak(greeting, interrupt=True)
 
         if stt is not None:
-            # speaking_guard hands off echo-cancellation to listen_and_transcribe:
-            # it will wait for TTS to drain, then add a 1 s speaker-settle delay
-            # and mute the mic mid-recording if TTS fires unexpectedly.
             print(f"[{current_person_name}] Sprechen… (Stille zum Beenden)", flush=True)
             try:
                 user_input = stt.listen_and_transcribe(
                     timeout=30.0,
                     stop_event=state.stop_event,
-                    speaking_guard=speech,
                 )
             except KeyboardInterrupt:
                 state.stop_event.set()
@@ -586,6 +583,10 @@ def main() -> None:
         except Exception:
             logger.warning("Web search module disabled")
 
+    # SharedState created early so speaking_event can be passed to speech/stt modules
+    state = SharedState()
+    state.current_person = UNKNOWN_PERSON_NAME
+
     # Text-to-speech
     speech: Optional[SpeechEngine] = None
     if not args.no_speech:
@@ -602,6 +603,7 @@ def main() -> None:
                 voice=active_voice or DEFAULT_VOICE,
                 sim_mode=sim_mode,
                 reachy=reachy,
+                speaking_event=state.speaking_event,
             )
         except Exception:
             logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
@@ -610,7 +612,7 @@ def main() -> None:
     stt: Optional[SpeechToText] = None
     if not args.text_input:
         try:
-            stt = SpeechToText(reachy=reachy)
+            stt = SpeechToText(reachy=reachy, speaking_event=state.speaking_event)
             logger.info("STT enabled (%s)", "Reachy mic" if reachy is not None else "system mic")
             stt.mic_selftest()
         except Exception:
@@ -634,9 +636,6 @@ def main() -> None:
         dance_fn=_dance_fn,
     )
     convo.set_profile(profile_instructions)
-
-    state = SharedState()
-    state.current_person = UNKNOWN_PERSON_NAME
 
     # Startup: play FREUDE animation and speak a greeting simultaneously
     emotions.play(Emotion.FREUDE)

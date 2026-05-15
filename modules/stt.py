@@ -100,12 +100,18 @@ class SpeechToText:
         OpenAI API key; defaults to OPENAI_API_KEY env var.
     """
 
-    def __init__(self, reachy=None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        reachy=None,
+        api_key: Optional[str] = None,
+        speaking_event: Optional[threading.Event] = None,
+    ) -> None:
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
             raise EnvironmentError("OPENAI_API_KEY not set — SpeechToText cannot initialise")
-        self._client = openai.OpenAI(api_key=key)
-        self._reachy  = reachy
+        self._client     = openai.OpenAI(api_key=key)
+        self._reachy     = reachy
+        self._mute_event = speaking_event   # set = mic muted (Reachy is speaking)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -174,34 +180,29 @@ class SpeechToText:
         self,
         timeout: float = MAX_DURATION,
         stop_event: Optional[threading.Event] = None,
-        speaking_guard=None,
     ) -> Optional[str]:
         """
         Block until speech is detected, record until silence, return transcript.
 
-        Parameters
-        ----------
-        speaking_guard : SpeechEngine or any object with .is_active property
-            When provided, the microphone is muted while the guard reports
-            active TTS playback.  After TTS finishes, a 1-second settle delay
-            is applied before recording starts, preventing echo.
+        Echo cancellation: if a speaking_event was passed to __init__(), this
+        method spin-waits at the entry point until the event is clear before
+        opening the microphone.  The _vad_loop also checks it continuously so
+        no audio is ever recorded while Reachy is speaking.
 
         Returns the stripped transcript string, or None if timed out,
         stop_event was set, no speech was detected, or transcription failed.
         """
-        # ── Echo cancellation gate ────────────────────────────────────────────
-        if speaking_guard is not None:
-            while getattr(speaking_guard, "is_active", False):
+        # ── Entry-point mute gate ─────────────────────────────────────────────
+        if self._mute_event is not None:
+            while self._mute_event.is_set():
                 if stop_event is not None and stop_event.is_set():
                     return None
-                time.sleep(0.05)
-            # Allow speaker cone and GStreamer buffer to fully drain
-            time.sleep(1.0)
+                time.sleep(0.1)
 
         if self._reachy is not None:
-            audio = self._record_sdk(timeout, stop_event, speaking_guard)
+            audio = self._record_sdk(timeout, stop_event)
         else:
-            audio = self._record_sounddevice(timeout, stop_event, speaking_guard)
+            audio = self._record_sounddevice(timeout, stop_event)
 
         if audio is None:
             return None
@@ -217,7 +218,6 @@ class SpeechToText:
         self,
         timeout: float,
         stop_event: Optional[threading.Event],
-        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         try:
             self._reachy.media.start_recording()
@@ -234,7 +234,6 @@ class SpeechToText:
                 timeout,
                 stop_event,
                 is_speech_fn=self._sdk_is_speech,
-                speaking_guard=speaking_guard,
             )
         finally:
             try:
@@ -274,7 +273,6 @@ class SpeechToText:
         self,
         timeout: float,
         stop_event: Optional[threading.Event],
-        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         try:
             import sounddevice as sd  # type: ignore
@@ -302,8 +300,7 @@ class SpeechToText:
                 return None
 
         try:
-            return self._vad_loop(chunk_fn, timeout, stop_event,
-                                  is_speech_fn=None, speaking_guard=speaking_guard)
+            return self._vad_loop(chunk_fn, timeout, stop_event, is_speech_fn=None)
         finally:
             try:
                 stream.stop()
@@ -319,7 +316,6 @@ class SpeechToText:
         timeout: float,
         stop_event: Optional[threading.Event],
         is_speech_fn: Optional[Callable[[], bool]] = None,
-        speaking_guard=None,
     ) -> Optional[np.ndarray]:
         """
         Read audio chunks from *chunk_fn*, apply VAD, and return a mono
@@ -334,8 +330,8 @@ class SpeechToText:
           RMS >= threshold only.
 
         Echo cancellation:
-          When speaking_guard.is_active is True, all chunks are discarded and
-          VAD state is reset — prevents Reachy's own voice from triggering STT.
+          When self._mute_event is set, all chunks are discarded and VAD state
+          is reset — prevents Reachy's own voice from triggering STT.
         """
         chunks:        list[np.ndarray] = []
         speech_chunks  = 0
@@ -349,14 +345,13 @@ class SpeechToText:
             if stop_event is not None and stop_event.is_set():
                 return None
 
-            # ── Echo gate: discard all audio while Reachy is speaking ────────
-            if speaking_guard is not None and getattr(speaking_guard, "is_active", False):
-                # Reset VAD state so any partial detection is discarded
+            # ── Echo gate: no recording while Reachy is speaking ─────────────
+            if self._mute_event is not None and self._mute_event.is_set():
                 chunks.clear()
                 speech_chunks  = 0
                 silence_chunks = 0
                 speech_started = False
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
 
             chunk = chunk_fn()

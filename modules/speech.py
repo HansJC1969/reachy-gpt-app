@@ -176,11 +176,12 @@ class SpeechEngine:
 
     def __init__(
         self,
-        api_key:  Optional[str] = None,
-        voice:    str   = DEFAULT_VOICE,
-        speed:    float = DEFAULT_SPEED,
-        sim_mode: bool  = False,
+        api_key:       Optional[str]            = None,
+        voice:         str                       = DEFAULT_VOICE,
+        speed:         float                     = DEFAULT_SPEED,
+        sim_mode:      bool                      = False,
         reachy=None,
+        speaking_event: Optional[threading.Event] = None,
     ) -> None:
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
@@ -194,13 +195,13 @@ class SpeechEngine:
         self._client       = openai.OpenAI(api_key=key)
         self._voice        = voice
         self._speed        = max(0.25, min(4.0, speed))
-        # For standard tts-1 voices the model can be upgraded to tts-1-hd via env var
         tts1_model = os.environ.get("REACHY_TTS_MODEL", "tts-1")
         self._tts_model    = tts1_model if cfg["supports_speed"] else cfg["model"]
         self._base_voice   = cfg["base_voice"]
         self._instructions = cfg["instructions"]
         self._sim_mode     = sim_mode
         self._reachy       = reachy
+        self._mute_event   = speaking_event      # shared Event; set=mic muted
         self._queue: queue.Queue = queue.Queue()
         self._stop_evt     = threading.Event()
         self._speaking     = threading.Event()
@@ -284,6 +285,13 @@ class SpeechEngine:
             except queue.Empty:
                 break
 
+    def _delayed_unmute(self) -> None:
+        """Clear the shared mute event 1.5 s after TTS finishes, if still idle."""
+        time.sleep(1.5)
+        if self._mute_event is not None and self._queue.empty() and not self._speaking.is_set():
+            self._mute_event.clear()
+            logger.debug("Mic unmuted (1.5 s post-TTS settle)")
+
     def _worker(self) -> None:
         """Background thread: pull text from queue → synthesize → play."""
         while True:
@@ -295,6 +303,9 @@ class SpeechEngine:
             self._stop_evt.clear()
             lang = detect_language(text)
             logger.debug("Speaking [%s]: %r", lang, text[:80])
+            # Mute mic BEFORE audio starts — no recording while Reachy speaks
+            if self._mute_event is not None:
+                self._mute_event.set()
             self._speaking.set()
             try:
                 audio = self._synthesize(text)
@@ -305,6 +316,12 @@ class SpeechEngine:
             finally:
                 self._speaking.clear()
                 self._queue.task_done()
+
+            # Schedule mic unmute only after the LAST queued utterance finishes
+            if self._mute_event is not None and self._queue.empty():
+                threading.Thread(
+                    target=self._delayed_unmute, daemon=True, name="tts-unmute"
+                ).start()
 
     def _synthesize(self, text: str) -> Optional[np.ndarray]:
         """Call OpenAI TTS and return PCM audio as a numpy int16 array."""
