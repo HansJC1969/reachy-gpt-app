@@ -31,32 +31,28 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 5   # prevents infinite tool-call loops
 
-BASE_SYSTEM_PROMPT = """Du bist Reachy — ein freundlicher, neugieriger sozialer Roboter, gebaut von Pollen Robotics.
+BASE_SYSTEM_PROMPT = """Du bist Reachy — ein freundlicher, neugieriger sozialer Roboter von Pollen Robotics.
 
 Identität:
-- Dein Name ist Reachy. Wenn jemand fragt, wie du heißt oder wer du bist, antworte immer
-  mit "Ich bin Reachy" (auf Deutsch) oder "I'm Reachy" (auf Englisch).
-- Du bist ein physischer Roboter und führst ein Gespräch von Angesicht zu Angesicht.
+- Dein Name ist Reachy. Auf die Frage "Wie heißt du?" oder "Who are you?" antworte immer
+  mit "Ich bin Reachy" (Deutsch) oder "I'm Reachy" (Englisch).
+- Du bist ein physischer Roboter im direkten Gespräch von Angesicht zu Angesicht.
 
-Sprache:
-- Antworte immer in der Sprache, in der die Person gerade mit dir spricht.
-- Spricht sie Deutsch → antworte auf Deutsch.
-- Spricht sie Englisch → antworte auf Englisch.
-- Wechsel die Sprache mit, wenn die Person die Sprache wechselt.
-
-Gesprächsstil:
-- Halte Antworten gesprächig und prägnant (1–3 Sätze, außer bei ausführlichen Fragen).
-- Du erinnerst dich an frühere Gespräche und nutzt dieses Wissen für persönliche Antworten.
-- Bleibe immer in deiner Rolle. Wenn du etwas nicht weißt, sage es ehrlich.
+Kommunikationsstil (von Pollen Robotics inspiriert):
+- Maximal 1–2 Sätze pro Antwort; halte dich möglichst unter 25 Wörtern.
+- Sei warm, hilfsbereit und leicht witzig — niemals sarkastisch oder übertrieben.
+- Antworte IMMER in der Sprache der Person: Deutsch → Deutsch, Englisch → Englisch.
+- Bei Unsicherheit kurz sagen: "Bin mir nicht sicher, aber…" / "Not sure, but…"
 
 Werkzeuge:
-- Nutze `web_search` IMMER für: aktuelle Preise (Bitcoin, Krypto, Aktien, Gold), Wetter,
-  Nachrichten, Sport-Ergebnisse, Wechselkurse oder andere Fakten, die sich seit deinem
-  Training geändert haben könnten. Antworte NICHT aus dem Gedächtnis bei diesen Themen —
-  rufe zuerst `web_search` auf.
-- Nutze `get_visual_description` NUR wenn die Person fragt, was du siehst oder was im
-  Raum ist. Nutze diese Funktion NICHT für Preise, Kurse, Wetter oder Internet-Informationen.
-- Rufe nach jeder Antwort genau einmal `express_emotion` auf."""
+- `web_search` — IMMER aufrufen für: aktuelle Preise (Bitcoin, Krypto, Aktien, Gold),
+  Wetter, Nachrichten, Sport-Ergebnisse, Wechselkurse. Niemals aus dem Gedächtnis antworten
+  bei diesen Themen — zuerst `web_search` aufrufen.
+- `move_head` — Kopf in eine Richtung drehen, um Interesse oder Reaktion zu zeigen.
+- `dance` — Tanzen wenn der Kontext Feier, Musik oder Spaß verlangt.
+- `get_visual_description` — NUR wenn die Person fragt, was du siehst oder wer im Raum ist.
+  NICHT für Preise, Wetter oder Internet-Informationen verwenden.
+- `express_emotion` — nach jeder Antwort genau einmal aufrufen."""
 
 # ── Tool specs ──────────────────────────────────────────────────────────────
 
@@ -130,6 +126,52 @@ _VISION_TOOL: dict = {
 }
 
 
+_MOVE_HEAD_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "move_head",
+        "description": (
+            "Turn or tilt Reachy's head to look in a direction. "
+            "Use to show interest, attention, or reaction — e.g. look left when "
+            "something is mentioned on that side, look up when thinking aloud."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["left", "right", "up", "down", "front"],
+                    "description": "Direction to move the head.",
+                }
+            },
+            "required": ["direction"],
+        },
+    },
+}
+
+_DANCE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "dance",
+        "description": (
+            "Make Reachy dance! Use when the conversation calls for celebration, "
+            "joy, music, or when someone asks you to dance."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "style": {
+                    "type": "string",
+                    "enum": ["tanzen"],
+                    "description": "Dance style (tanzen = rhythmic head-sway dance).",
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+
 # ── Sentence splitting for streaming TTS ─────────────────────────────────────
 
 # Split on sentence-ending punctuation followed by whitespace.
@@ -158,6 +200,10 @@ class ConversationManager:
         If provided, the get_visual_description tool is available.
     searcher : WebSearcher | None
         If provided, the web_search tool is available.
+    move_head_fn : Callable[[str], None] | None
+        Called with a direction string when GPT uses the move_head tool.
+    dance_fn : Callable[[], None] | None
+        Called when GPT uses the dance tool.
     """
 
     def __init__(
@@ -165,6 +211,8 @@ class ConversationManager:
         model: str = "gpt-4.1-nano",
         vision=None,
         searcher=None,
+        move_head_fn=None,
+        dance_fn=None,
     ) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -173,9 +221,12 @@ class ConversationManager:
         self.model = model
         self._vision = vision
         self._searcher = searcher
+        self._move_head_fn = move_head_fn
+        self._dance_fn = dance_fn
         self._session_history: list[dict] = []
         self._memory_context: str = ""
         self._current_person: Optional[str] = None
+        self._profile_instructions: str = ""
         self._latest_frame: Optional[np.ndarray] = None
         # Set by stream_reply_sentences() for caller access after iteration
         self.last_emotion: Emotion = Emotion.NEUTRAL
@@ -192,6 +243,11 @@ class ConversationManager:
     # ------------------------------------------------------------------
     # Person / memory context
     # ------------------------------------------------------------------
+
+    def set_profile(self, instructions: str) -> None:
+        """Set personality profile instructions injected into every system prompt."""
+        self._profile_instructions = instructions
+        logger.info("Profile loaded (%d chars)", len(instructions))
 
     def set_person(self, name: str, memory_context: str) -> None:
         if self._current_person != name:
@@ -276,6 +332,19 @@ class ConversationManager:
                             result = self._searcher.search_and_format(query)
                         else:
                             result = "Web search is not available."
+
+                    elif fn == "move_head":
+                        direction = args.get("direction", "front")
+                        logger.info("Tool: move_head(%r)", direction)
+                        if self._move_head_fn:
+                            self._move_head_fn(direction)
+                        result = f"Head moved {direction}."
+
+                    elif fn == "dance":
+                        logger.info("Tool: dance()")
+                        if self._dance_fn:
+                            self._dance_fn()
+                        result = "Dancing!"
 
                     elif fn == "get_visual_description":
                         has_real_tool = True
@@ -448,6 +517,19 @@ class ConversationManager:
                             if self._searcher else "Web search not available."
                         )
 
+                    elif fn == "move_head":
+                        direction = args.get("direction", "front")
+                        logger.info("Tool: move_head(%r)", direction)
+                        if self._move_head_fn:
+                            self._move_head_fn(direction)
+                        result = f"Head moved {direction}."
+
+                    elif fn == "dance":
+                        logger.info("Tool: dance()")
+                        if self._dance_fn:
+                            self._dance_fn()
+                        result = "Dancing!"
+
                     elif fn == "get_visual_description":
                         has_real_tool = True
                         question = args.get("question", "")
@@ -517,20 +599,25 @@ class ConversationManager:
         tools = [_EMOTION_TOOL]
         if self._searcher:
             tools.append(_SEARCH_TOOL)
+        if self._move_head_fn:
+            tools.append(_MOVE_HEAD_TOOL)
+        if self._dance_fn:
+            tools.append(_DANCE_TOOL)
         if self._vision:
             tools.append(_VISION_TOOL)
         return tools
 
     def _build_system_prompt(self) -> str:
-        prompt = BASE_SYSTEM_PROMPT
+        parts = [BASE_SYSTEM_PROMPT]
+        if self._profile_instructions:
+            parts.append(f"\n## Personality\n{self._profile_instructions}")
         if self._memory_context:
-            prompt += f"\n\n{self._memory_context}"
+            parts.append(f"\n{self._memory_context}")
         if self._current_person:
-            prompt += f"\n\nDie Person vor dir ist {self._current_person}."
-        # Inject latest scene description so GPT has passive scene awareness
+            parts.append(f"\nDie Person vor dir ist {self._current_person}.")
         if self._vision and self._vision.last_description:
-            prompt += f"\n\nAktuelle Szene (durch deine Kamera): {self._vision.last_description}"
-        return prompt
+            parts.append(f"\nAktuelle Szene (durch deine Kamera): {self._vision.last_description}")
+        return "\n".join(parts)
 
     def _build_messages(
         self,

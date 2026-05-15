@@ -252,6 +252,38 @@ ANIMATIONS: dict[Emotion, Animation] = {
 
 
 # ---------------------------------------------------------------------------
+# Directional head moves  (used by the move_head GPT tool)
+# ---------------------------------------------------------------------------
+
+_HEAD_MOVE_ANIMATIONS: dict[str, Animation] = {
+    "left": Animation(keyframes=[
+        Keyframe(t=0.0, pitch=0,   yaw=-30, roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=1.2, pitch=0,   yaw=-30, roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
+    ]),
+    "right": Animation(keyframes=[
+        Keyframe(t=0.0, pitch=0,   yaw=30,  roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=1.2, pitch=0,   yaw=30,  roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
+    ]),
+    "up": Animation(keyframes=[
+        Keyframe(t=0.0, pitch=15,  yaw=0,   roll=0, l_ant=15, r_ant=15),
+        Keyframe(t=1.2, pitch=15,  yaw=0,   roll=0, l_ant=15, r_ant=15),
+        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0,  r_ant=0),
+    ]),
+    "down": Animation(keyframes=[
+        Keyframe(t=0.0, pitch=-12, yaw=0,   roll=0, l_ant=-10, r_ant=-10),
+        Keyframe(t=1.2, pitch=-12, yaw=0,   roll=0, l_ant=-10, r_ant=-10),
+        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0,   r_ant=0),
+    ]),
+    "front": Animation(keyframes=[
+        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=0.6, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
+    ]),
+}
+
+
+# ---------------------------------------------------------------------------
 # Emotion engine
 # ---------------------------------------------------------------------------
 
@@ -320,6 +352,25 @@ class EmotionEngine:
         """Return gently to neutral (used when no face is detected)."""
         if self.current_emotion != Emotion.NEUTRAL:
             self.play(Emotion.NEUTRAL)
+
+    def move_head(self, direction: str) -> None:
+        """
+        Move head to a named direction, hold briefly, then return to neutral.
+
+        direction : "left" | "right" | "up" | "down" | "front"
+        """
+        anim = _HEAD_MOVE_ANIMATIONS.get(direction.lower())
+        if anim is None:
+            logger.warning("move_head: unknown direction %r", direction)
+            return
+        self._cancel()
+        self._set_emotion(Emotion.NEUTRAL)
+        self._stop_evt.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(anim,), name=f"head-{direction}", daemon=True
+        )
+        self._thread.start()
+        logger.info("[emotion] move_head(%s)", direction)
 
     # ------------------------------------------------------------------
     # Animation runner

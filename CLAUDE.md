@@ -17,12 +17,23 @@ reachy-gpt-app/
 ├── modules/
 │   ├── __init__.py
 │   ├── conversation.py              # GPT-4o chat + tool-execution loop
-│   ├── emotions.py                  # Keyframe animations: neck + antennas
+│   ├── emotions.py                  # Keyframe animations: neck + antennas; move_head()
 │   ├── face_tracking.py             # OpenCV Haar cascade + neck control
 │   ├── face_recognition_module.py   # face_recognition lib + pickle storage
 │   ├── memory.py                    # SQLite: persons / conversations / summaries
+│   ├── profiles.py                  # Personality profile loader (instructions + voice)
+│   ├── speech.py                    # OpenAI TTS: queue-based, SDK + sounddevice backends
+│   ├── stt.py                       # OpenAI Whisper STT + DoA/RMS VAD
 │   ├── vision.py                    # GPT-4o vision: scene description
 │   └── websearch.py                 # Web search: Tavily (primary) / DuckDuckGo
+├── profiles/
+│   ├── default/                     # Standard Reachy — warm, curious, coral voice
+│   ├── captain_circuit/             # Pirate robot — echo voice
+│   ├── hype_bot/                    # Enthusiastic hype machine — shimmer voice
+│   ├── noir_detective/              # Hard-boiled noir detective — onyx voice
+│   ├── mars_rover/                  # Space-exploration scientist — alloy voice
+│   ├── mad_scientist/               # Eccentric Professor Zap — fable voice
+│   └── time_traveler/               # Temporal explorer — sage voice
 ├── requirements.txt
 ├── .env.template                    # Copy → .env and fill values
 ├── CLAUDE.md                        # This file
@@ -264,15 +275,52 @@ are being rejected.
 ## CLI flags
 
 ```
-python main.py                         # Full run (requires REACHY_IP)
-python main.py --no-robot              # Simulated robot
-python main.py --no-vision             # Disable GPT-4o scene analysis
-python main.py --no-search             # Disable web search
-python main.py --setup                 # Init DB only
-python main.py --add-person "Alice"    # Register Alice's face
-python main.py --camera 1              # Use camera device 1
-python main.py --emotion-test          # Demo all emotion animations
+python main.py                              # Full run
+python main.py --no-robot                  # Simulated robot (no Reachy hardware)
+python main.py --profile captain_circuit   # Use a personality profile
+python main.py --voice onyx                # Override TTS voice
+python main.py --no-vision                 # Disable GPT-4o scene analysis
+python main.py --no-search                 # Disable web search
+python main.py --setup                     # Init DB only
+python main.py --add-person "Alice"        # Register Alice's face
+python main.py --camera 1                  # Use camera device 1
+python main.py --emotion-test              # Demo all emotion animations
+python main.py --text-input                # Keyboard input instead of microphone
 ```
+
+## Personality profiles
+
+Profiles live in `profiles/<name>/` with two files:
+- `instructions.txt` — personality text injected into every system prompt
+- `voice.txt` — optional TTS voice override
+
+| Profile | Character | Voice |
+|---|---|---|
+| `default` | Warm, curious, lightly witty Reachy | coral |
+| `captain_circuit` | Pirate robot — "aye matey!" | echo |
+| `hype_bot` | Ultra-enthusiastic motivator | shimmer |
+| `noir_detective` | Hard-boiled noir detective | onyx |
+| `mars_rover` | Space-exploration scientist | alloy |
+| `mad_scientist` | Eccentric Professor Zap | fable |
+| `time_traveler` | Temporal explorer from many eras | sage |
+
+### Adding a custom profile
+```bash
+mkdir profiles/my_robot
+echo "Personality: ..." > profiles/my_robot/instructions.txt
+echo "nova" > profiles/my_robot/voice.txt
+python main.py --profile my_robot
+```
+
+## GPT tools available to the model
+
+| Tool | Trigger | Execution |
+|---|---|---|
+| `express_emotion` | every reply | captures emotion → EmotionEngine.play() |
+| `web_search` | current facts needed | Tavily / DuckDuckGo |
+| `move_head` | show attention or reaction | EmotionEngine.move_head(direction) |
+| `dance` | celebration / music / fun | EmotionEngine.play(TANZEN) |
+| `get_visual_description` | visual question | VisionAnalyzer.analyze_on_command() |
 
 ## Robot SDK notes
 

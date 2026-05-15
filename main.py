@@ -62,7 +62,8 @@ from modules.memory import (
     load_recent_messages,
     build_memory_context,
 )
-from modules.speech import SpeechEngine, detect_language, sounddevice_available
+from modules.profiles import list_profiles, load_profile
+from modules.speech import SpeechEngine, AVAILABLE_VOICES, detect_language, sounddevice_available
 from modules.stt import SpeechToText
 from modules.vision import VisionAnalyzer
 from modules.websearch import WebSearcher
@@ -461,6 +462,7 @@ def run_emotion_test(reachy) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reachy GPT conversational robot")
+    profiles = list_profiles()
     parser.add_argument("--no-robot",     action="store_true")
     parser.add_argument("--setup",        action="store_true")
     parser.add_argument("--add-person",   metavar="NAME")
@@ -471,6 +473,19 @@ def main() -> None:
     parser.add_argument("--no-speech",    action="store_true", help="Disable text-to-speech output")
     parser.add_argument("--speech-sim",   action="store_true", help="TTS synthesis without audio playback")
     parser.add_argument("--text-input",   action="store_true", help="Use keyboard instead of microphone")
+    parser.add_argument(
+        "--profile",
+        default="default",
+        choices=profiles or ["default"],
+        metavar="PROFILE",
+        help=f"Personality profile (available: {', '.join(profiles) or 'default'})",
+    )
+    parser.add_argument(
+        "--voice",
+        default=None,
+        choices=sorted(AVAILABLE_VOICES),
+        help="Override TTS voice (overrides profile voice.txt)",
+    )
     args = parser.parse_args()
 
     # ---- one-shot commands -------------------------------------------------
@@ -501,6 +516,15 @@ def main() -> None:
 
     # ---- normal run --------------------------------------------------------
     init_db()
+
+    # Load personality profile
+    profile_instructions, profile_voice = load_profile(args.profile)
+    active_voice = args.voice or profile_voice  # CLI --voice overrides profile
+    logger.info(
+        "Profile: %s  |  voice: %s",
+        args.profile,
+        active_voice or "(default)",
+    )
 
     # Optional modules
     vision: Optional[VisionAnalyzer] = None
@@ -535,7 +559,11 @@ def main() -> None:
             if sim_mode and not args.speech_sim:
                 logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
         try:
-            speech = SpeechEngine(sim_mode=sim_mode, reachy=reachy)
+            speech = SpeechEngine(
+                voice=active_voice or "coral",
+                sim_mode=sim_mode,
+                reachy=reachy,
+            )
         except Exception:
             logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
 
@@ -551,7 +579,21 @@ def main() -> None:
     tracker    = FaceTracker(reachy=reachy)
     recognizer = FaceRecognitionModule()
     emotions   = EmotionEngine(reachy=reachy)
-    convo      = ConversationManager(vision=vision, searcher=searcher)
+
+    # Motion callables exposed as GPT tools
+    def _move_head_fn(direction: str) -> None:
+        emotions.move_head(direction)
+
+    def _dance_fn() -> None:
+        emotions.play(Emotion.TANZEN)
+
+    convo = ConversationManager(
+        vision=vision,
+        searcher=searcher,
+        move_head_fn=_move_head_fn,
+        dance_fn=_dance_fn,
+    )
+    convo.set_profile(profile_instructions)
 
     state = SharedState()
     state.current_person = UNKNOWN_PERSON_NAME
@@ -559,7 +601,10 @@ def main() -> None:
     # Startup: play FREUDE animation and speak a greeting simultaneously
     emotions.play(Emotion.FREUDE)
     if speech:
-        speech.speak("Hallo! Ich bin bereit. Wie kann ich dir helfen?")
+        greeting = "Hallo! Ich bin bereit. Wie kann ich dir helfen?"
+        if args.profile and args.profile != "default":
+            logger.info("Active personality profile: %s", args.profile)
+        speech.speak(greeting)
 
     # Build thread list — vision_loop only started when vision module is active.
     # Use None as target sentinel; the loop below skips those entries.

@@ -48,12 +48,23 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE     = 24_000        # OpenAI PCM output: 24 kHz, 16-bit, mono
 _SDK_RATE       = 16_000        # Reachy Mini SDK audio rate (push_audio_sample)
 _SDK_CHUNK_SIZE = _SDK_RATE // 4  # 250 ms chunks for interruptible SDK playback
-DEFAULT_VOICE = os.environ.get("REACHY_VOICE", "nova")
+DEFAULT_VOICE = os.environ.get("REACHY_VOICE", "coral")
 DEFAULT_SPEED = float(os.environ.get("REACHY_SPEECH_SPEED", "1.0"))
 DEFAULT_MODEL = os.environ.get("REACHY_TTS_MODEL", "tts-1")   # or "tts-1-hd"
 
-# OpenAI TTS voices (both tts-1 and tts-1-hd)
-AVAILABLE_VOICES = {"alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}
+# OpenAI TTS voices for tts-1 / tts-1-hd
+# coral  — warm, versatile (good default for German + English)
+# nova   — bright, friendly
+# onyx   — deep, cinematic
+# echo   — bold, clear
+# shimmer — energetic, bright
+# alloy  — neutral, precise
+# ash    — calm, measured
+# fable  — expressive, quirky
+# sage   — wise, thoughtful
+AVAILABLE_VOICES = frozenset({
+    "alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"
+})
 
 # ── Language detection ────────────────────────────────────────────────────────
 
