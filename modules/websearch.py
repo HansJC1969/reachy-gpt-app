@@ -164,7 +164,7 @@ class WebSearcher:
     ) -> list[SearchResult]:
         from tavily import TavilyClient  # type: ignore
 
-        client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+        client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY", ""))
 
         kwargs: dict = dict(
             query=query,

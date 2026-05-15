@@ -50,10 +50,12 @@ Gesprächsstil:
 - Bleibe immer in deiner Rolle. Wenn du etwas nicht weißt, sage es ehrlich.
 
 Werkzeuge:
-- Nutze `web_search` für aktuelle Informationen, Nachrichten, Wetter, Preise oder Fakten,
-  die sich seit deinem Training geändert haben könnten.
-- Nutze `get_visual_description`, wenn die Person fragt, was du siehst, oder wenn
-  der visuelle Kontext deine Antwort verbessern würde.
+- Nutze `web_search` IMMER für: aktuelle Preise (Bitcoin, Krypto, Aktien, Gold), Wetter,
+  Nachrichten, Sport-Ergebnisse, Wechselkurse oder andere Fakten, die sich seit deinem
+  Training geändert haben könnten. Antworte NICHT aus dem Gedächtnis bei diesen Themen —
+  rufe zuerst `web_search` auf.
+- Nutze `get_visual_description` NUR wenn die Person fragt, was du siehst oder was im
+  Raum ist. Nutze diese Funktion NICHT für Preise, Kurse, Wetter oder Internet-Informationen.
 - Rufe nach jeder Antwort genau einmal `express_emotion` auf."""
 
 # ── Tool specs ──────────────────────────────────────────────────────────────
@@ -82,9 +84,11 @@ _SEARCH_TOOL: dict = {
     "function": {
         "name": "web_search",
         "description": (
-            "Search the internet for current information. "
-            "Use when you need recent news, facts, weather, prices, or anything "
-            "that might be outdated in your training data."
+            "Search the internet for current, real-time information. "
+            "ALWAYS use this for: cryptocurrency prices (Bitcoin, Ethereum, etc.), "
+            "stock prices, currency exchange rates, weather forecasts, current news, "
+            "sports scores, inflation data, or any fact that may have changed since "
+            "training. Do NOT answer these topics from memory — call this tool first."
         ),
         "parameters": {
             "type": "object",
@@ -104,9 +108,10 @@ _VISION_TOOL: dict = {
     "function": {
         "name": "get_visual_description",
         "description": (
-            "Look through the robot's camera and describe what you see. "
-            "Use when the person asks what you see, or when scene context "
-            "would help answer their question."
+            "Look through the robot's camera and describe what is physically visible. "
+            "Use ONLY when the person asks what you see, who is in the room, or when "
+            "the scene context would help. Do NOT use for prices, weather, news, "
+            "cryptocurrency, stocks, or any internet-based information."
         ),
         "parameters": {
             "type": "object",
