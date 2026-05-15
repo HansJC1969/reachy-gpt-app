@@ -196,7 +196,9 @@ class ConversationManager:
     Parameters
     ----------
     model : str
-        OpenAI chat model (default: gpt-4.1-nano).
+        OpenAI chat model.  Defaults to OPENAI_MODEL env var, or gpt-4o-mini.
+        gpt-4o-mini is the minimum recommended for reliable tool calling;
+        nano-class models frequently skip web_search and answer from memory.
     vision : VisionAnalyzer | None
         If provided, the get_visual_description tool is available.
     searcher : WebSearcher | None
@@ -207,9 +209,11 @@ class ConversationManager:
         Called when GPT uses the dance tool.
     """
 
+    _DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
     def __init__(
         self,
-        model: str = "gpt-4.1-nano",
+        model: str = "",
         vision=None,
         searcher=None,
         move_head_fn=None,
@@ -219,7 +223,8 @@ class ConversationManager:
         if not api_key:
             raise EnvironmentError("OPENAI_API_KEY not set in environment")
         self.client = openai.OpenAI(api_key=api_key)
-        self.model = model
+        self.model = model or self._DEFAULT_MODEL
+        logger.info("ConversationManager: model=%s", self.model)
         self._vision = vision
         self._searcher = searcher
         self._move_head_fn = move_head_fn
@@ -649,7 +654,7 @@ if __name__ == "__main__":
     searcher = WebSearcher()
     mgr = ConversationManager(searcher=searcher)
     mgr.set_person("Tester", "")
-    print("GPT-4o chat with web search.  Type 'quit' to exit.\n")
+    print(f"Chat ({mgr.model}) with web search.  Type 'quit' to exit.\n")
     while True:
         try:
             user = input("You: ").strip()
