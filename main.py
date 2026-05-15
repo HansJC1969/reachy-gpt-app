@@ -77,9 +77,7 @@ IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
 
-# Disable head/body tracking until motors are separately tested and calibrated.
-# Set True only after verifying joint limits and movement feel on the physical robot.
-TRACKING_ENABLED     = False
+TRACKING_ENABLED     = True
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +90,7 @@ class SharedState:
         self.latest_face:  Optional[FacePosition] = None
         self.current_person: Optional[str] = None
         self.last_face_seen: float = time.monotonic()
-
-
+        self.sleeping: bool = False   # True while in sleep mode — pauses tracking
 
         self.frame_lock   = threading.Lock()
         self.face_lock    = threading.Lock()
@@ -186,6 +183,12 @@ def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
     logger.info("Tracking thread started")
     was_tracking = False
     while not state.stop_event.is_set():
+        # Pause tracking while in sleep mode so the sleep pose isn't disturbed
+        if state.sleeping:
+            was_tracking = False
+            time.sleep(0.1)
+            continue
+
         with state.face_lock:
             face = state.latest_face
         if face is not None:
@@ -365,6 +368,7 @@ def conversation_loop(
             logger.info("Sleep command: %r", user_input)
             if speech:
                 speech.stop()
+            state.sleeping = True   # pause face tracking so it doesn't disturb the pose
             # Droop animation runs in calling thread (~6 s), then holds pose
             emotions.sleep_mode()
             print("💤 Reachy schläft — sag 'Reachy', 'wache auf' oder 'wake up'", flush=True)
@@ -394,6 +398,7 @@ def conversation_loop(
 
                 if _is_wake_word(wake_input):
                     logger.info("Wake word detected: %r", wake_input)
+                    state.sleeping = False  # resume face tracking
                     emotions.play(Emotion.FREUDE)
                     if speech:
                         speech.speak("Ich bin wieder da!", interrupt=True)
@@ -642,7 +647,6 @@ def main() -> None:
     # Use None as target sentinel; the loop below skips those entries.
     thread_specs = [
         ("camera",       True,  camera_loop,                               (state, tracker, args.camera, reachy)),
-        # tracking_loop is disabled until motors are tested and calibrated
         ("tracking",     True,  tracking_loop if TRACKING_ENABLED else None, (state, tracker)),
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
         ("idle",         True,  idle_loop,                                  (state, emotions)),
