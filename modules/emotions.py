@@ -326,9 +326,12 @@ class EmotionEngine:
         cancelled immediately.  Set block=True to wait for completion.
         """
         self._cancel()
+        # Only clear stop_evt after the previous thread has had a chance to stop.
+        # _cancel() already called join(timeout=0.5), so this is as safe as we can
+        # make it without blocking indefinitely on a stuck robot SDK call.
+        self._stop_evt.clear()
         self._set_emotion(emotion)
         anim = ANIMATIONS.get(emotion, ANIMATIONS[Emotion.NEUTRAL])
-        self._stop_evt.clear()
 
         self._thread = threading.Thread(
             target=self._run,
@@ -364,8 +367,8 @@ class EmotionEngine:
             logger.warning("move_head: unknown direction %r", direction)
             return
         self._cancel()
-        self._set_emotion(Emotion.NEUTRAL)
         self._stop_evt.clear()
+        self._set_emotion(Emotion.NEUTRAL)
         self._thread = threading.Thread(
             target=self._run, args=(anim,), name=f"head-{direction}", daemon=True
         )
@@ -379,7 +382,11 @@ class EmotionEngine:
     def _cancel(self) -> None:
         self._stop_evt.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.3)
+            self._thread.join(timeout=0.5)
+            if self._thread.is_alive():
+                # Robot SDK call may still be in-flight; log and continue —
+                # _stop_evt remains set so the thread will exit on its next check.
+                logger.debug("_cancel: animation thread did not stop within timeout")
 
     def _run(self, anim: Animation) -> None:
         repeats = 0

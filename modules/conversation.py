@@ -427,145 +427,150 @@ class ConversationManager:
         self.last_reply = ""
         reply_parts: list[str] = []
 
-        for _round in range(MAX_TOOL_ROUNDS):
-            tool_calls_acc: dict[int, dict] = {}
-            text_chunks:    list[str]       = []
-            sentence_buf = ""
+        try:
+            for _round in range(MAX_TOOL_ROUNDS):
+                tool_calls_acc: dict[int, dict] = {}
+                text_chunks:    list[str]       = []
+                sentence_buf = ""
 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                max_tokens=400,
-                temperature=0.8,
-                stream=True,
-            )
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=400,
+                    temperature=0.8,
+                    stream=True,
+                )
 
-            for chunk in response:
-                delta = chunk.choices[0].delta
+                for chunk in response:
+                    delta = chunk.choices[0].delta
 
-                # Stream text → yield complete sentences immediately
-                if delta.content:
-                    text_chunks.append(delta.content)
-                    sentence_buf += delta.content
-                    sentences, sentence_buf = _split_sentences(sentence_buf)
-                    for s in sentences:
-                        reply_parts.append(s)
-                        yield s
+                    # Stream text → yield complete sentences immediately
+                    if delta.content:
+                        text_chunks.append(delta.content)
+                        sentence_buf += delta.content
+                        sentences, sentence_buf = _split_sentences(sentence_buf)
+                        for s in sentences:
+                            reply_parts.append(s)
+                            yield s
 
-                # Accumulate tool-call deltas (id + name in first chunk, arguments build up)
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                        if tc_delta.id:
-                            tool_calls_acc[idx]["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_calls_acc[idx]["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+                    # Accumulate tool-call deltas (id + name in first chunk, arguments build up)
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc_delta.id:
+                                tool_calls_acc[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_acc[idx]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
 
-            # Flush any sentence fragment left in the buffer
-            remaining = sentence_buf.strip()
-            if remaining:
-                reply_parts.append(remaining)
-                yield remaining
+                # Flush any sentence fragment left in the buffer
+                remaining = sentence_buf.strip()
+                if remaining:
+                    reply_parts.append(remaining)
+                    yield remaining
 
-            # No tool calls → GPT is done
-            if not tool_calls_acc:
-                break
+                # No tool calls → GPT is done
+                if not tool_calls_acc:
+                    break
 
-            # Append assistant message (content + tool_calls) to history
-            full_text = "".join(text_chunks)
-            messages.append({
-                "role": "assistant",
-                "content": full_text or None,
-                "tool_calls": [
-                    {
-                        "id":       tc["id"],
-                        "type":     "function",
-                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                    }
-                    for tc in tool_calls_acc.values()
-                ],
-            })
-
-            # Execute tool calls and collect results
-            tool_results: list[dict] = []
-            has_real_tool = False
-
-            for tc in tool_calls_acc.values():
-                fn = tc["name"]
-                try:
-                    args = json.loads(tc["arguments"])
-                except json.JSONDecodeError:
-                    args = {}
-
-                try:
-                    if fn == "express_emotion":
-                        self.last_emotion = parse_emotion(args.get("emotion", "neutral"))
-                        result = "ok"
-
-                    elif fn == "web_search":
-                        has_real_tool = True
-                        query = args.get("query", "")
-                        logger.info("Tool: web_search(%r)", query)
-                        result = (
-                            self._searcher.search_and_format(query)
-                            if self._searcher else "Web search not available."
-                        )
-
-                    elif fn == "move_head":
-                        direction = args.get("direction", "front")
-                        logger.info("Tool: move_head(%r)", direction)
-                        if self._move_head_fn:
-                            self._move_head_fn(direction)
-                        result = f"Head moved {direction}."
-
-                    elif fn == "dance":
-                        logger.info("Tool: dance()")
-                        if self._dance_fn:
-                            self._dance_fn()
-                        result = "Dancing!"
-
-                    elif fn == "get_visual_description":
-                        has_real_tool = True
-                        question = args.get("question", "")
-                        logger.info("Tool: get_visual_description(%r)", question)
-                        if self._vision and self._latest_frame is not None:
-                            result = self._vision.analyze_on_command(
-                                self._latest_frame, question or "What do you see?"
-                            )
-                        elif self._vision:
-                            result = "No camera frame available."
-                        else:
-                            result = "Visual analysis not available."
-
-                    else:
-                        result = f"Unknown tool: {fn}"
-
-                except Exception:
-                    logger.exception("Tool execution failed for '%s'", fn)
-                    result = f"Tool '{fn}' encountered an error."
-
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
+                # Append assistant message (content + tool_calls) to history
+                full_text = "".join(text_chunks)
+                messages.append({
+                    "role": "assistant",
+                    "content": full_text or None,
+                    "tool_calls": [
+                        {
+                            "id":       tc["id"],
+                            "type":     "function",
+                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        }
+                        for tc in tool_calls_acc.values()
+                    ],
                 })
 
-            messages.extend(tool_results)
+                # Execute tool calls and collect results
+                tool_results: list[dict] = []
+                has_real_tool = False
 
-            if not has_real_tool:
-                break  # express_emotion only — text already yielded, done
+                for tc in tool_calls_acc.values():
+                    fn = tc["name"]
+                    try:
+                        args = json.loads(tc["arguments"])
+                    except json.JSONDecodeError:
+                        args = {}
 
-        self.last_reply = " ".join(reply_parts)
-        self._session_history.append({"role": "user",      "content": user_input})
-        self._session_history.append({"role": "assistant", "content": self.last_reply})
-        logger.debug("Stream done: %r  emotion=%s", self.last_reply[:80], self.last_emotion.value)
+                    try:
+                        if fn == "express_emotion":
+                            self.last_emotion = parse_emotion(args.get("emotion", "neutral"))
+                            result = "ok"
+
+                        elif fn == "web_search":
+                            has_real_tool = True
+                            query = args.get("query", "")
+                            logger.info("Tool: web_search(%r)", query)
+                            result = (
+                                self._searcher.search_and_format(query)
+                                if self._searcher else "Web search not available."
+                            )
+
+                        elif fn == "move_head":
+                            direction = args.get("direction", "front")
+                            logger.info("Tool: move_head(%r)", direction)
+                            if self._move_head_fn:
+                                self._move_head_fn(direction)
+                            result = f"Head moved {direction}."
+
+                        elif fn == "dance":
+                            logger.info("Tool: dance()")
+                            if self._dance_fn:
+                                self._dance_fn()
+                            result = "Dancing!"
+
+                        elif fn == "get_visual_description":
+                            has_real_tool = True
+                            question = args.get("question", "")
+                            logger.info("Tool: get_visual_description(%r)", question)
+                            if self._vision and self._latest_frame is not None:
+                                result = self._vision.analyze_on_command(
+                                    self._latest_frame, question or "What do you see?"
+                                )
+                            elif self._vision:
+                                result = "No camera frame available."
+                            else:
+                                result = "Visual analysis not available."
+
+                        else:
+                            result = f"Unknown tool: {fn}"
+
+                    except Exception:
+                        logger.exception("Tool execution failed for '%s'", fn)
+                        result = f"Tool '{fn}' encountered an error."
+
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    })
+
+                messages.extend(tool_results)
+
+                if not has_real_tool:
+                    break  # express_emotion only — text already yielded, done
+
+        finally:
+            # Always commit whatever was collected — even if an exception fires
+            # mid-stream, partial sentences may already have been sent to TTS,
+            # so last_reply and session_history must reflect what was actually said.
+            self.last_reply = " ".join(reply_parts)
+            self._session_history.append({"role": "user",      "content": user_input})
+            self._session_history.append({"role": "assistant", "content": self.last_reply})
+            logger.debug("Stream done: %r  emotion=%s", self.last_reply[:80], self.last_emotion.value)
 
     def stream_chat(self, user_input: str) -> Generator[str, None, None]:
         """Streaming text-only variant (no tool calls, no emotion)."""
