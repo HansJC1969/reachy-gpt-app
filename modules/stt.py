@@ -85,6 +85,48 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "de")
 # Hard timeout waiting for speech onset
 MAX_DURATION = 30.0
 
+# ---------------------------------------------------------------------------
+# Whisper hallucination filter
+# ---------------------------------------------------------------------------
+# Whisper reliably produces these strings on near-silence, background noise,
+# or very short clips — they are never real user speech.
+# Reference: https://github.com/openai/whisper/discussions/928
+
+_HALLUCINATION_EXACT: frozenset[str] = frozenset({
+    # subtitle artefacts injected by Whisper's training data
+    "amara", "amara.org", "untertitel von", "untertitel durch",
+    "untertitelung", "untertitel", "ondertitels",
+    "sous-titres", "sous-titrage", "sous titres",
+    "subtitles by", "subtitled by", "subtitling",
+    "captions by", "transcribed by", "translated by",
+    # filler phrases produced on silence
+    "danke", "danke schön", "bitte", "auf wiedersehen",
+    "thank you", "thanks for watching", "thanks for listening",
+    "please subscribe", "like and subscribe",
+    "www.mooji.org", "www.zeguide.com",
+    # punctuation-only garbage
+    "...", ". . .", "…",
+})
+
+_HALLUCINATION_SUBSTR: tuple[str, ...] = (
+    "amara.org",
+    "mooji.org",
+    "untertitel von der deutschen",
+    "untertitelung im auftrag",
+    "subtitles by explosiveskull",
+    "we'll be right back",
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    """Return True when *text* is a known Whisper phantom artefact."""
+    raw  = text.strip().lower()
+    norm = raw.rstrip(".,!?… ")
+    # Check both raw and punctuation-stripped forms so "..." → "" still matches
+    if raw in _HALLUCINATION_EXACT or norm in _HALLUCINATION_EXACT:
+        return True
+    return any(sub in raw for sub in _HALLUCINATION_SUBSTR)
+
 
 class SpeechToText:
     """
@@ -431,7 +473,12 @@ class SpeechToText:
             )
             text = result.strip() if isinstance(result, str) else str(result).strip()
             logger.debug("STT transcript: %r", text[:120])
-            return text or None
+            if not text:
+                return None
+            if _is_hallucination(text):
+                logger.info("STT: hallucination discarded: %r", text[:80])
+                return None
+            return text
         except openai.APIError as exc:
             logger.error("Whisper API error: %s", exc)
             return None
