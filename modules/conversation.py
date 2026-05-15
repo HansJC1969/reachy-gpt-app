@@ -21,11 +21,12 @@ from typing import Optional, Generator
 
 import numpy as np
 import openai
+from pathlib import Path
 from dotenv import load_dotenv
 
 from modules.emotions import Emotion, parse_emotion
 
-load_dotenv()
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 

@@ -34,9 +34,10 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 # ---------------------------------------------------------------------------
 # Logging

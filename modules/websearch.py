@@ -1,37 +1,46 @@
 """
 Web search for Reachy — gives GPT-4o access to current information.
 
-Backend priority:
-  1. Tavily (TAVILY_API_KEY set in .env)  — PRIMARY; designed for AI agents
-  2. DuckDuckGo (ddgs package)            — fallback only if Tavily fails
+Backend priority
+----------------
+  1. Tavily (TAVILY_API_KEY in .env)  — PRIMARY; AI-native, real-time results
+  2. DuckDuckGo (ddgs package)         — last-resort fallback only
 
-Query-aware Tavily settings:
-  • Finance queries (bitcoin, price, stock…): topic="finance", time_range="day"
-  • News/weather/sports queries:             topic="news",    time_range="day"
-  • Everything else:                         topic="general", search_depth="advanced"
-  include_answer="advanced" is always requested so GPT gets a synthesised answer.
+Tavily is always tried first when TAVILY_API_KEY is present.  DuckDuckGo is
+only reached if Tavily raises an exception.
 
-If Tavily fails at runtime the call falls through to DuckDuckGo automatically.
+Query-aware Tavily settings
+---------------------------
+  Finance (bitcoin, kurs, aktie…): topic="finance", time_range="day"
+  News/weather/sports (heute, wetter, nachrichten…): topic="news", time_range="day"
+  Everything else:  search_depth="advanced"
+  include_answer="advanced" is always set → Tavily prepends a synthesised answer.
 
-DuckDuckGo uses backend="html" (avoids Bing rate limits) via the "ddgs" package.
-
-Standalone test:
-    python -m modules.websearch "Bitcoin price today"
-    python -m modules.websearch "Wetter in Berlin heute"
+Standalone test
+---------------
+    python -m modules.websearch "Bitcoin Kurs heute"
+    python -m modules.websearch "Wetter Wien"
+    python -m modules.websearch "aktuelle Nachrichten"
+    python -m modules.websearch --debug "Euro Kurs"
 """
 
 import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Always load from the project-root .env regardless of the working directory.
+# This ensures the key is present whether the module is imported from main.py,
+# from a test script, or from any other working directory.
+_ENV_PATH = Path(__file__).parent.parent / ".env"
+load_dotenv(_ENV_PATH)
 
 logger = logging.getLogger(__name__)
 
-MAX_SNIPPET_LEN = 400
+MAX_SNIPPET_LEN = 500
 
 
 # ── Query classification ──────────────────────────────────────────────────────
@@ -53,7 +62,7 @@ _NEWS_RE = re.compile(
 
 def _classify_query(query: str) -> tuple[str, str | None]:
     """
-    Return (tavily_topic, time_range) for the query.
+    Return (tavily_topic, time_range).
 
     topic     : "finance" | "news" | "general"
     time_range: "day" | None
@@ -78,47 +87,74 @@ class SearchResult:
 
 class WebSearcher:
     """
-    Unified search interface.  Auto-selects the best available backend.
+    Unified search interface.
+
+    Tavily is always the primary backend.  DuckDuckGo is a last-resort fallback.
 
     Usage
     -----
     searcher = WebSearcher()
-    results  = searcher.search("Bitcoin price today")
-    text     = searcher.format_results(results)
+    text     = searcher.search_and_format("Bitcoin Kurs heute")
     """
 
     def __init__(self) -> None:
-        self._backend = self._detect_backend()
-        logger.info("WebSearcher using backend: %s", self._backend)
+        # Re-read the key here so we pick up any late .env loading
+        self._tavily_key: str = os.environ.get("TAVILY_API_KEY", "").strip()
+        self._has_ddg: bool   = self._check_ddg()
+        self._log_startup()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def backend(self) -> str:
+        """Primary backend that will be attempted first."""
+        if self._tavily_key:
+            return "tavily"
+        if self._has_ddg:
+            return "duckduckgo"
+        return "none"
 
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         """Run a web search and return up to *max_results* results."""
         topic, time_range = _classify_query(query)
-        logger.info("Searching [%s | topic=%s]: %r", self._backend, topic, query)
 
-        # Always try Tavily first if the API key is present, regardless of
-        # which backend was detected at start-up, because Tavily is more
-        # reliable for financial and real-time queries.
-        if os.environ.get("TAVILY_API_KEY"):
+        # ── Tavily (primary) ─────────────────────────────────────────────────
+        # Re-check key at call time so it works even if the env var is set
+        # after WebSearcher was constructed (e.g. late dotenv loading).
+        api_key = os.environ.get("TAVILY_API_KEY", "").strip() or self._tavily_key
+        if api_key:
+            logger.info(
+                "Tavily search [topic=%s time_range=%s]: %r", topic, time_range, query
+            )
             try:
-                return self._search_tavily(query, max_results, topic=topic, time_range=time_range)
+                return self._search_tavily(
+                    query, max_results, api_key=api_key,
+                    topic=topic, time_range=time_range,
+                )
             except Exception as exc:
-                logger.warning("Tavily failed (%s) — falling back to DuckDuckGo", exc)
+                logger.error(
+                    "Tavily search FAILED (%s: %s) — falling back to DuckDuckGo",
+                    type(exc).__name__, exc,
+                )
 
-        if self._backend != "none":
+        # ── DuckDuckGo (last-resort fallback) ────────────────────────────────
+        if self._has_ddg:
+            logger.info("DuckDuckGo fallback search: %r", query)
             try:
                 return self._search_ddg(query, max_results, time_range=time_range)
-            except Exception:
-                logger.exception("DuckDuckGo search failed for %r", query)
+            except Exception as exc:
+                logger.error("DuckDuckGo search FAILED (%s: %s)", type(exc).__name__, exc)
 
+        logger.error(
+            "No search backend available. "
+            "Set TAVILY_API_KEY in .env or install ddgs."
+        )
         return []
 
     def format_results(self, results: list[SearchResult]) -> str:
-        """Format results as a numbered markdown list for GPT context."""
+        """Format results as a numbered list for GPT context."""
         if not results:
-            return "No results found."
+            return "No search results found."
         lines: list[str] = []
         for i, r in enumerate(results, 1):
             snippet = r.snippet[:MAX_SNIPPET_LEN]
@@ -128,29 +164,28 @@ class WebSearcher:
         return "\n\n".join(lines)
 
     def search_and_format(self, query: str, max_results: int = 5) -> str:
-        """Convenience: search and return formatted string in one call."""
+        """Convenience: search + format in one call."""
         return self.format_results(self.search(query, max_results))
 
-    @property
-    def backend(self) -> str:
-        return self._backend
+    # ── Startup diagnostics ───────────────────────────────────────────────────
 
-    # ── Backend detection ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _detect_backend() -> str:
-        if os.environ.get("TAVILY_API_KEY"):
-            try:
-                import tavily  # noqa: F401
-                return "tavily"
-            except ImportError:
-                logger.warning("TAVILY_API_KEY set but tavily-python not installed")
-        try:
-            import ddgs  # noqa: F401
-            return "duckduckgo"
-        except ImportError:
-            logger.warning("ddgs not installed — run: pip install ddgs")
-            return "none"
+    def _log_startup(self) -> None:
+        if self._tavily_key:
+            logger.info(
+                "WebSearcher ready — PRIMARY: Tavily (key …%s)%s",
+                self._tavily_key[-4:],
+                "  fallback: DuckDuckGo" if self._has_ddg else "",
+            )
+        elif self._has_ddg:
+            logger.warning(
+                "WebSearcher ready — TAVILY_API_KEY not set; using DuckDuckGo only. "
+                "Set TAVILY_API_KEY in .env for reliable real-time results."
+            )
+        else:
+            logger.error(
+                "WebSearcher: NO search backend available. "
+                "Set TAVILY_API_KEY in .env and/or run: pip install ddgs"
+            )
 
     # ── Tavily ────────────────────────────────────────────────────────────────
 
@@ -159,28 +194,32 @@ class WebSearcher:
         query: str,
         max_results: int,
         *,
+        api_key: str,
         topic: str,
         time_range: str | None,
     ) -> list[SearchResult]:
         from tavily import TavilyClient  # type: ignore
 
-        client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY", ""))
+        client = TavilyClient(api_key=api_key)
 
-        kwargs: dict = dict(
-            query=query,
-            max_results=max_results,
-            topic=topic,
-            include_answer="advanced",   # AI-synthesised direct answer
-        )
+        kwargs: dict = {
+            "query":          query,
+            "max_results":    max_results,
+            "include_answer": "advanced",   # prepend AI-synthesised direct answer
+        }
+        # topic defaults to "general" in Tavily — only pass non-default values
+        if topic in ("news", "finance"):
+            kwargs["topic"] = topic
         if time_range:
             kwargs["time_range"] = time_range
+        # For general queries, request deeper crawl
         if topic == "general":
             kwargs["search_depth"] = "advanced"
 
         resp = client.search(**kwargs)
         results: list[SearchResult] = []
 
-        # Prepend the synthesised answer as a top result when present
+        # Prepend the synthesised answer as result #0 when present
         answer = (resp.get("answer") or "").strip()
         if answer:
             results.append(SearchResult(
@@ -196,6 +235,10 @@ class WebSearcher:
                 snippet=r.get("content", ""),
             ))
 
+        logger.info(
+            "Tavily returned %d results (direct_answer=%s)",
+            len(results), bool(answer),
+        )
         return results
 
     # ── DuckDuckGo ────────────────────────────────────────────────────────────
@@ -207,17 +250,16 @@ class WebSearcher:
         *,
         time_range: str | None,
     ) -> list[SearchResult]:
-        DDGS = self._import_ddgs()
-        if DDGS is None:
-            logger.error("No DuckDuckGo package available")
+        try:
+            from ddgs import DDGS  # type: ignore
+        except ImportError:
+            logger.error("ddgs not installed — run: pip install ddgs")
             return []
 
-        # timelimit: Tavily uses "day"/"week"; DDG uses "d"/"w"
-        ddg_timelimit_map = {"day": "d", "week": "w", "month": "m", "year": "y"}
-        timelimit = ddg_timelimit_map.get(time_range or "", None)
+        ddg_timelimit = {"day": "d", "week": "w", "month": "m", "year": "y"}
+        timelimit = ddg_timelimit.get(time_range or "")
 
         results: list[SearchResult] = []
-        # html backend avoids Bing (which rate-limits heavily for finance queries)
         for backend in ("html", "lite"):
             try:
                 with DDGS() as ddgs:
@@ -235,30 +277,50 @@ class WebSearcher:
                 if results:
                     return results
             except Exception as exc:
-                logger.warning("DDG backend=%s failed (%s)", backend, exc)
+                logger.warning("DDG backend=%s failed (%s: %s)", backend, type(exc).__name__, exc)
 
         return results
 
     @staticmethod
-    def _import_ddgs():
-        """Return the DDGS class from the ddgs package, or None if not installed."""
+    def _check_ddg() -> bool:
         try:
-            from ddgs import DDGS  # type: ignore
-            return DDGS
+            from ddgs import DDGS  # noqa: F401
+            return True
         except ImportError:
-            return None
+            return False
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
     import sys
-    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
 
-    query = " ".join(sys.argv[1:]) or "Pollen Robotics Reachy Mini"
+    parser = argparse.ArgumentParser(description="Reachy web search standalone test")
+    parser.add_argument("query", nargs="*", help="Search query words")
+    parser.add_argument("--debug", action="store_true", help="Show DEBUG log level")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(levelname)-8s %(name)s: %(message)s",
+    )
+
+    query = " ".join(args.query) if args.query else "Reachy Mini Pollen Robotics"
     topic, time_range = _classify_query(query)
+
+    print(f"Query      : {query!r}")
+    print(f"Topic      : {topic}  |  time_range: {time_range}")
+    print(f"TAVILY_KEY : {'set (' + os.environ.get('TAVILY_API_KEY','')[-4:] + ')' if os.environ.get('TAVILY_API_KEY') else 'NOT SET — check .env'}")
+    print()
+
     searcher = WebSearcher()
     print(f"Backend    : {searcher.backend}")
-    print(f"Topic      : {topic}  |  time_range: {time_range}\n")
+    print()
+
     results = searcher.search(query)
+    if not results:
+        print("No results returned.")
+        sys.exit(1)
+
     print(searcher.format_results(results))

@@ -20,9 +20,10 @@ from typing import Optional
 import cv2
 import numpy as np
 import openai
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
