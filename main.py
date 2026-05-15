@@ -245,6 +245,10 @@ def idle_loop(state: SharedState, emotions: EmotionEngine) -> None:
     was_idle = False
     while not state.stop_event.is_set():
         time.sleep(1.0)
+        # Don't interfere with sleep mode — pose is held by EmotionEngine
+        if state.sleeping:
+            was_idle = False
+            continue
         idle_sec = time.monotonic() - state.last_face_seen
         if idle_sec > IDLE_TIMEOUT:
             if not was_idle:
