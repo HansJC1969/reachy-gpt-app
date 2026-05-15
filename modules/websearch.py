@@ -172,8 +172,7 @@ class WebSearcher:
     def _log_startup(self) -> None:
         if self._tavily_key:
             logger.info(
-                "WebSearcher ready — PRIMARY: Tavily (key …%s)%s",
-                self._tavily_key[-4:],
+                "WebSearcher ready — PRIMARY: Tavily%s",
                 "  fallback: DuckDuckGo" if self._has_ddg else "",
             )
         elif self._has_ddg:
@@ -311,7 +310,7 @@ if __name__ == "__main__":
 
     print(f"Query      : {query!r}")
     print(f"Topic      : {topic}  |  time_range: {time_range}")
-    print(f"TAVILY_KEY : {'set (' + os.environ.get('TAVILY_API_KEY','')[-4:] + ')' if os.environ.get('TAVILY_API_KEY') else 'NOT SET — check .env'}")
+    print(f"TAVILY_KEY : {'set' if os.environ.get('TAVILY_API_KEY') else 'NOT SET — check .env'}")
     print()
 
     searcher = WebSearcher()

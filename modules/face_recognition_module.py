@@ -196,12 +196,20 @@ class FaceRecognitionModule:
             self._encodings = {}
 
     def _save_encodings(self) -> None:
+        # Write to a temp file first, then atomically rename to avoid
+        # corrupting the encodings file if the process crashes mid-write.
+        tmp_path = ENCODINGS_PATH.with_suffix(".pkl.tmp")
         try:
-            with open(ENCODINGS_PATH, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 pickle.dump(self._encodings, f)
+            tmp_path.replace(ENCODINGS_PATH)
             logger.info("Encodings saved to %s", ENCODINGS_PATH)
         except OSError:
             logger.exception("Failed to save encodings to %s", ENCODINGS_PATH)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Public API

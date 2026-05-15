@@ -157,7 +157,14 @@ def _create_summary(person_id: int, up_to_msg: int) -> None:
         ).fetchall()
 
     messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+    if not messages:
+        logger.warning("_create_summary: no messages found for person_id=%d — skipping", person_id)
+        return
+
     transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+    if not transcript.strip():
+        logger.warning("_create_summary: empty transcript for person_id=%d — skipping", person_id)
+        return
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:

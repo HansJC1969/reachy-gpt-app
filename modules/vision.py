@@ -139,8 +139,11 @@ class VisionAnalyzer:
         """
         with self._lock:
             last = self._last_analyzed
-        if time.monotonic() - last < self._interval:
-            return None
+            if time.monotonic() - last < self._interval:
+                return None
+            # Mark as in-progress immediately to prevent concurrent calls from
+            # also passing the interval check (TOCTOU guard).
+            self._last_analyzed = time.monotonic()
         try:
             desc = self.analyze(frame)
             with self._lock:
@@ -150,6 +153,9 @@ class VisionAnalyzer:
             return desc
         except Exception:
             logger.exception("Vision periodic analysis failed")
+            # Reset the timer so a failed call can be retried after the interval
+            with self._lock:
+                self._last_analyzed = last
             return None
 
     def analyze_on_command(

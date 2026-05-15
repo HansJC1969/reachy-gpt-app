@@ -253,7 +253,7 @@ class SpeechEngine:
     def wait_until_done(self, timeout: float = 30.0) -> None:
         """Block until the speech queue is drained, or *timeout* seconds elapse."""
         deadline = time.monotonic() + timeout
-        while self._queue.unfinished_tasks > 0:
+        while not self._queue.empty() or self._speaking.is_set():
             if time.monotonic() >= deadline:
                 logger.warning("wait_until_done: timed out after %.1fs", timeout)
                 return

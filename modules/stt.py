@@ -257,7 +257,7 @@ class SpeechToText:
                 return None
 
             chunk = chunk_fn()
-            if chunk is None:
+            if chunk is None or len(chunk) == 0:
                 continue
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))

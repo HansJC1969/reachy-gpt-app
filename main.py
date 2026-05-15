@@ -157,26 +157,27 @@ def camera_loop(
             return
 
         logger.info("Camera thread started (OpenCV device %d)", camera_idx)
-        while not state.stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning("Camera read failed; retrying…")
-                time.sleep(0.05)
-                continue
+        try:
+            while not state.stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("Camera read failed; retrying…")
+                    time.sleep(0.05)
+                    continue
 
-            with state.frame_lock:
-                state.latest_frame = frame.copy()
+                with state.frame_lock:
+                    state.latest_frame = frame.copy()
 
-            face = tracker.detect_face(frame)
-            with state.face_lock:
-                state.latest_face = face
-                if face is not None:
-                    state.last_face_seen = time.monotonic()
+                face = tracker.detect_face(frame)
+                with state.face_lock:
+                    state.latest_face = face
+                    if face is not None:
+                        state.last_face_seen = time.monotonic()
 
-            time.sleep(0.033)   # ~30 fps
-
-        cap.release()
-        logger.info("Camera thread stopped")
+                time.sleep(0.033)   # ~30 fps
+        finally:
+            cap.release()
+            logger.info("Camera thread stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -321,15 +322,19 @@ def conversation_loop(
 
         if person_name != current_person_name:
             current_person_name = person_name
-            current_person_id = get_or_create_person(person_name)
-            memory_ctx = build_memory_context(current_person_id)
+            try:
+                current_person_id = get_or_create_person(person_name)
+                memory_ctx = build_memory_context(current_person_id)
+            except Exception:
+                logger.exception("Failed to load memory context for '%s'", person_name)
+                current_person_id = None
+                memory_ctx = ""
             convo.set_person(person_name, memory_ctx)
             logger.info("Context refreshed for '%s'", person_name)
-            if current_person_id is not None:
-                emotions.play(Emotion.NEUGIER)
-                greeting = f"Hallo{', ' + current_person_name if current_person_name != UNKNOWN_PERSON_NAME else ''}! Schön, dich zu sehen."
-                if speech:
-                    speech.speak(greeting, interrupt=True)
+            emotions.play(Emotion.NEUGIER)
+            greeting = f"Hallo{', ' + current_person_name if current_person_name != UNKNOWN_PERSON_NAME else ''}! Schön, dich zu sehen."
+            if speech:
+                speech.speak(greeting, interrupt=True)
 
         if stt is not None:
             # Wait for any ongoing TTS to finish so the mic doesn't capture
@@ -394,7 +399,7 @@ def conversation_loop(
         # Show "thinking" while waiting for GPT
         emotions.play(Emotion.NACHDENKEN)
 
-        history = load_recent_messages(current_person_id, limit=10)
+        history = load_recent_messages(current_person_id, limit=10) if current_person_id is not None else []
         try:
             # Stream sentences to TTS as they arrive — first sentence plays while
             # GPT is still generating the rest, cutting perceived latency.
@@ -417,8 +422,12 @@ def conversation_loop(
         lang = detect_language(reply)
         print(f"Reachy [{emotion.value}][{lang}]: {reply}\n")
 
-        save_message(current_person_id, "user", user_input)
-        save_message(current_person_id, "assistant", reply)
+        if current_person_id is not None:
+            try:
+                save_message(current_person_id, "user", user_input)
+                save_message(current_person_id, "assistant", reply)
+            except Exception:
+                logger.exception("Failed to save messages for person_id=%d", current_person_id)
 
     logger.info("Conversation thread stopped")
 

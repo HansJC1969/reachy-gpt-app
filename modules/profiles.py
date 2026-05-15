@@ -23,10 +23,13 @@ Usage
     instructions, voice = load_profile("captain_circuit")
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 PROFILES_DIR = Path(__file__).parent.parent / "profiles"
+
+logger = logging.getLogger(__name__)
 
 
 def list_profiles() -> list[str]:
@@ -53,17 +56,27 @@ def load_profile(name: str) -> tuple[str, Optional[str]]:
     profile_dir = PROFILES_DIR / name
 
     instructions_path = profile_dir / "instructions.txt"
-    instructions = (
-        instructions_path.read_text(encoding="utf-8").strip()
-        if instructions_path.exists()
-        else ""
-    )
+    instructions = ""
+    if instructions_path.exists():
+        try:
+            instructions = instructions_path.read_text(encoding="utf-8").strip()
+        except (UnicodeDecodeError, OSError) as exc:
+            logger.warning(
+                "Could not read profile instructions for %r (%s) — using empty instructions",
+                name, exc,
+            )
 
     voice_path = profile_dir / "voice.txt"
     voice: Optional[str] = None
     if voice_path.exists():
-        v = voice_path.read_text(encoding="utf-8").strip()
-        if v:
-            voice = v
+        try:
+            v = voice_path.read_text(encoding="utf-8").strip()
+            if v:
+                voice = v
+        except (UnicodeDecodeError, OSError) as exc:
+            logger.warning(
+                "Could not read voice.txt for profile %r (%s) — using default voice",
+                name, exc,
+            )
 
     return instructions, voice
