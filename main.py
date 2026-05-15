@@ -6,7 +6,6 @@ Threads:
   • camera_loop       – captures frames, runs Haar face detection (~30 fps)
   • tracking_loop     – moves neck/body to follow face (20 Hz)
   • recognition_loop  – identifies person every N frames
-  • vision_loop       – GPT-4o scene description every VISION_INTERVAL seconds
   • idle_loop         – triggers MÜDE emotion when no face is seen for a while
   • conversation_loop – stdin → GPT-4o (with web search + vision) → stdout + TTS
 
@@ -16,7 +15,7 @@ CLI flags:
   --add-person "Name" Register a new face and exit
   --camera INDEX      OpenCV device index used only in --no-robot sim mode (default: $CAMERA_INDEX or 0)
   --emotion-test      Play each emotion in sequence and exit
-  --no-vision         Disable automatic scene analysis
+  --no-vision         Disable GPT-4o vision (on-demand "Was siehst du?" tool)
   --no-search         Disable web search
   --no-speech         Disable text-to-speech output
   --speech-sim        TTS synthesis but no audio playback (for testing)
@@ -73,7 +72,7 @@ from modules.websearch import WebSearcher
 # Constants
 # ---------------------------------------------------------------------------
 RECOGNITION_INTERVAL = 15       # run face recognition every N frames
-VISION_INTERVAL      = 30.0    # seconds between automatic scene analyses
+VISION_INTERVAL      = 30.0    # interval kept for VisionAnalyzer constructor (unused for passive loop)
 IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
@@ -94,8 +93,7 @@ class SharedState:
         self.current_person: Optional[str] = None
         self.last_face_seen: float = time.monotonic()
 
-        # Most recent automatic scene description (set by vision_loop)
-        self.latest_scene: Optional[str] = None
+
 
         self.frame_lock   = threading.Lock()
         self.face_lock    = threading.Lock()
@@ -235,33 +233,6 @@ def recognition_loop(state: SharedState, recognizer: FaceRecognitionModule) -> N
 
 
 # ---------------------------------------------------------------------------
-# Thread: GPT-4o vision — automatic scene description
-# ---------------------------------------------------------------------------
-
-def vision_loop(state: SharedState, vision: VisionAnalyzer) -> None:
-    """
-    Every VISION_INTERVAL seconds: grab the latest frame, send it to
-    GPT-4o vision, and store the description in state.latest_scene.
-    The conversation_loop injects this description into the system prompt
-    so Reachy has passive scene awareness at all times.
-    """
-    logger.info("Vision thread started (interval=%.0fs)", VISION_INTERVAL)
-    while not state.stop_event.is_set():
-        time.sleep(1.0)     # check every second; VisionAnalyzer controls actual interval
-
-        with state.frame_lock:
-            frame = state.latest_frame
-        if frame is None:
-            continue
-
-        desc = vision.analyze_periodic(frame)
-        if desc:
-            state.latest_scene = desc
-            logger.info("Scene: %s", desc[:80])
-
-    logger.info("Vision thread stopped")
-
-
 # ---------------------------------------------------------------------------
 # Thread: idle emotion
 # ---------------------------------------------------------------------------
@@ -542,7 +513,7 @@ def main() -> None:
     if not args.no_vision:
         try:
             vision = VisionAnalyzer(interval=VISION_INTERVAL)
-            logger.info("Vision module enabled (interval=%.0fs)", VISION_INTERVAL)
+            logger.info("Vision module enabled (on-demand only — triggered by 'Was siehst du?')")
         except Exception:
             logger.warning("Vision module disabled (check OPENAI_API_KEY)")
 
@@ -618,14 +589,13 @@ def main() -> None:
             logger.info("Active personality profile: %s", args.profile)
         speech.speak(greeting)
 
-    # Build thread list — vision_loop only started when vision module is active.
+    # Build thread list.
     # Use None as target sentinel; the loop below skips those entries.
     thread_specs = [
         ("camera",       True,  camera_loop,                               (state, tracker, args.camera, reachy)),
         # tracking_loop is disabled until motors are tested and calibrated
         ("tracking",     True,  tracking_loop if TRACKING_ENABLED else None, (state, tracker)),
         ("recognition",  True,  recognition_loop,                           (state, recognizer)),
-        ("vision",       True,  vision_loop if vision is not None else None, (state, vision)),
         ("idle",         True,  idle_loop,                                  (state, emotions)),
         ("conversation", False, conversation_loop,                          (state, convo, emotions, speech, stt)),
     ]

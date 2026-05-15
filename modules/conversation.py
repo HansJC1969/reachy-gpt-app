@@ -626,8 +626,6 @@ class ConversationManager:
             parts.append(f"\n{self._memory_context}")
         if self._current_person:
             parts.append(f"\nDie Person vor dir ist {self._current_person}.")
-        if self._vision and self._vision.last_description:
-            parts.append(f"\nAktuelle Szene (durch deine Kamera): {self._vision.last_description}")
         return "\n".join(parts)
 
     def _build_messages(
