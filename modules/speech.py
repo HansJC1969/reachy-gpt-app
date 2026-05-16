@@ -176,12 +176,13 @@ class SpeechEngine:
 
     def __init__(
         self,
-        api_key:       Optional[str]            = None,
-        voice:         str                       = DEFAULT_VOICE,
-        speed:         float                     = DEFAULT_SPEED,
-        sim_mode:      bool                      = False,
+        api_key:        Optional[str]            = None,
+        voice:          str                      = DEFAULT_VOICE,
+        speed:          float                    = DEFAULT_SPEED,
+        sim_mode:       bool                     = False,
         reachy=None,
         speaking_event: Optional[threading.Event] = None,
+        movement_manager=None,
     ) -> None:
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
@@ -205,6 +206,19 @@ class SpeechEngine:
         self._queue: queue.Queue = queue.Queue()
         self._stop_evt     = threading.Event()
         self._speaking     = threading.Event()
+
+        # HeadWobbler: makes Reachy's head sway in sync with speech audio
+        self._head_wobbler = None
+        if movement_manager is not None:
+            try:
+                from modules.head_wobbler import HeadWobbler
+                self._head_wobbler = HeadWobbler(
+                    set_speech_offsets=movement_manager.set_speech_offsets
+                )
+                self._head_wobbler.start()
+                logger.info("HeadWobbler enabled — head will sway during speech")
+            except Exception as e:
+                logger.warning("HeadWobbler not available: %s", e)
 
         self._worker_thread = threading.Thread(
             target=self._worker, name="speech-worker", daemon=True
@@ -272,6 +286,8 @@ class SpeechEngine:
         self.stop()
         self._queue.put(_SENTINEL)
         self._worker_thread.join(timeout=2.0)
+        if self._head_wobbler is not None:
+            self._head_wobbler.stop()
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -315,7 +331,12 @@ class SpeechEngine:
             try:
                 audio = self._synthesize(text)
                 if audio is not None and not self._stop_evt.is_set():
+                    # Feed PCM to HeadWobbler so head sways in sync with speech
+                    if self._head_wobbler is not None:
+                        self._head_wobbler.feed_pcm(audio.reshape(1, -1), SAMPLE_RATE)
                     self._play(audio)
+                    if self._head_wobbler is not None:
+                        self._head_wobbler.request_reset_after_current_audio()
             except Exception:
                 logger.exception("TTS worker error")
             finally:

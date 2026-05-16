@@ -54,6 +54,7 @@ logger = logging.getLogger("main")
 from modules.conversation import ConversationManager
 from modules.emotions import Emotion, EmotionEngine, SLEEP_POSE
 from modules.face_tracking import FaceTracker, FacePosition
+from modules.moves import MovementManager
 from modules.face_recognition_module import FaceRecognitionModule
 from modules.memory import (
     init_db,
@@ -77,7 +78,6 @@ IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
 
-TRACKING_ENABLED     = True
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +138,7 @@ def camera_loop(
                 state.latest_frame = frame.copy()
 
             face = tracker.detect_face(frame)
+            tracker.update_offsets(face)   # feeds MovementManager secondary offsets
             with state.face_lock:
                 state.latest_face = face
                 if face is not None:
@@ -165,6 +166,7 @@ def camera_loop(
                     state.latest_frame = frame.copy()
 
                 face = tracker.detect_face(frame)
+                tracker.update_offsets(face)   # feeds MovementManager secondary offsets
                 with state.face_lock:
                     state.latest_face = face
                     if face is not None:
@@ -174,33 +176,6 @@ def camera_loop(
         finally:
             cap.release()
             logger.info("Camera thread stopped")
-
-
-# ---------------------------------------------------------------------------
-# Thread: face tracking
-# ---------------------------------------------------------------------------
-
-def tracking_loop(state: SharedState, tracker: FaceTracker) -> None:
-    logger.info("Tracking thread started")
-    was_tracking = False
-    while not state.stop_event.is_set():
-        # Pause tracking while in sleep mode so the sleep pose isn't disturbed
-        if state.sleeping:
-            was_tracking = False
-            time.sleep(0.1)
-            continue
-
-        with state.face_lock:
-            face = state.latest_face
-        if face is not None:
-            tracker.update(face)
-            was_tracking = True
-        elif was_tracking:
-            # Face just lost — center once; don't repeat at 20 Hz
-            tracker.center_head()
-            was_tracking = False
-        time.sleep(0.05)    # 20 Hz
-    logger.info("Tracking thread stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -619,26 +594,14 @@ def main() -> None:
     state = SharedState()
     state.current_person = UNKNOWN_PERSON_NAME
 
-    # Text-to-speech
+    # Text-to-speech (created after MovementManager below — placeholder here)
     speech: Optional[SpeechEngine] = None
+    sim_mode: bool = args.speech_sim
     if not args.no_speech:
-        if reachy is not None:
-            # On-robot: SDK GStreamer backend owns the audio hardware.
-            # sounddevice cannot reach the speaker; use push_audio_sample instead.
-            sim_mode = args.speech_sim
-        else:
+        if reachy is None:
             sim_mode = args.speech_sim or not sounddevice_available()
             if sim_mode and not args.speech_sim:
                 logger.warning("No audio output device found — TTS in sim mode (synthesis only)")
-        try:
-            speech = SpeechEngine(
-                voice=active_voice or DEFAULT_VOICE,
-                sim_mode=sim_mode,
-                reachy=reachy,
-                speaking_event=state.speaking_event,
-            )
-        except Exception:
-            logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
 
     # Speech-to-text
     stt: Optional[SpeechToText] = None
@@ -652,7 +615,29 @@ def main() -> None:
 
     tracker    = FaceTracker(reachy=reachy)
     recognizer = FaceRecognitionModule()
-    emotions   = EmotionEngine(reachy=reachy)
+
+    # MovementManager: 60Hz control loop owning all set_target() calls.
+    # FaceTracker acts as camera_worker — exposes get_face_tracking_offsets().
+    movement_manager: Optional[MovementManager] = None
+    if reachy is not None:
+        movement_manager = MovementManager(reachy, camera_worker=tracker)
+        movement_manager.start()
+        logger.info("MovementManager started")
+
+    emotions = EmotionEngine(reachy=reachy, movement_manager=movement_manager)
+
+    # Create SpeechEngine with HeadWobbler wired to MovementManager
+    if not args.no_speech:
+        try:
+            speech = SpeechEngine(
+                voice=active_voice or DEFAULT_VOICE,
+                sim_mode=sim_mode,
+                reachy=reachy,
+                speaking_event=state.speaking_event,
+                movement_manager=movement_manager,
+            )
+        except Exception:
+            logger.warning("TTS disabled (check OPENAI_API_KEY or sounddevice installation)")
 
     # Motion callables exposed as GPT tools
     def _move_head_fn(direction: str) -> None:
@@ -677,20 +662,16 @@ def main() -> None:
             logger.info("Active personality profile: %s", args.profile)
         speech.speak(greeting)
 
-    # Build thread list.
-    # Use None as target sentinel; the loop below skips those entries.
+    # Thread list — tracking_loop removed; MovementManager polls face offsets at 60Hz
     thread_specs = [
-        ("camera",       True,  camera_loop,                               (state, tracker, args.camera, reachy)),
-        ("tracking",     True,  tracking_loop if TRACKING_ENABLED else None, (state, tracker)),
-        ("recognition",  True,  recognition_loop,                           (state, recognizer)),
-        ("idle",         True,  idle_loop,                                  (state, emotions)),
-        ("conversation", False, conversation_loop,                          (state, convo, emotions, speech, stt)),
+        ("camera",       True,  camera_loop,       (state, tracker, args.camera, reachy)),
+        ("recognition",  True,  recognition_loop,  (state, recognizer)),
+        ("idle",         True,  idle_loop,          (state, emotions)),
+        ("conversation", False, conversation_loop,  (state, convo, emotions, speech, stt)),
     ]
 
     threads = []
     for name, is_daemon, target, t_args in thread_specs:
-        if target is None:
-            continue
         t = threading.Thread(target=target, args=t_args, name=name, daemon=is_daemon)
         threads.append(t)
 
@@ -711,12 +692,10 @@ def main() -> None:
         emotions.stop()
         if speech:
             speech.shutdown()
+        if movement_manager is not None:
+            movement_manager.stop()
         logger.info("Shutting down…")
         if reachy is not None:
-            try:
-                tracker.center_head()
-            except Exception:
-                logger.warning("Could not centre head on shutdown", exc_info=True)
             try:
                 reachy.__exit__(None, None, None)
             except Exception:

@@ -1,13 +1,12 @@
 """
-Emotional expression for Reachy Mini.
+Emotion and movement control for Reachy Mini.
 
-Drives neck (yaw / pitch / roll) and both antennas through keyframe animations.
-Each emotion plays in a background daemon thread, so the caller never blocks
-unless block=True is passed to EmotionEngine.play().
+Uses pollen-robotics MovementManager + RecordedMoves (SDK pre-recorded animations)
+when a robot is connected. Falls back to legacy keyframe animations in sim mode.
 
-Standalone demo (no robot):
-    python -m modules.emotions --demo
-    python -m modules.emotions --demo --emotion tanzen
+Supported emotions (map to RecordedMoves names discovered at runtime):
+    NEUTRAL, FREUDE, TRAUER, ANGST, MÜDE, NACHDENKEN,
+    TANZEN, ÜBERRASCHUNG, NEUGIER
 """
 
 from __future__ import annotations
@@ -18,9 +17,12 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from modules.moves import MovementManager
 
 logger = logging.getLogger(__name__)
 
@@ -31,37 +33,40 @@ logger = logging.getLogger(__name__)
 
 class Emotion(Enum):
     NEUTRAL       = "neutral"
-    FREUDE        = "freude"          # joy / happiness
-    TRAUER        = "trauer"          # sadness
-    ANGST         = "angst"           # fear
-    MÜDE          = "müde"            # tired
-    NACHDENKEN    = "nachdenken"      # thinking / pondering
-    TANZEN        = "tanzen"          # dancing
-    ÜBERRASCHUNG  = "ueberraschung"   # surprise
-    NEUGIER       = "neugier"         # curiosity
+    FREUDE        = "freude"
+    TRAUER        = "trauer"
+    ANGST         = "angst"
+    MÜDE          = "müde"
+    NACHDENKEN    = "nachdenken"
+    TANZEN        = "tanzen"
+    ÜBERRASCHUNG  = "ueberraschung"
+    NEUGIER       = "neugier"
 
 
-# Map GPT label strings → Emotion (for flexible matching)
 EMOTION_LABELS: dict[str, Emotion] = {e.value: e for e in Emotion}
 EMOTION_LABELS.update({
-    "joy": Emotion.FREUDE,
-    "happy": Emotion.FREUDE,
-    "happiness": Emotion.FREUDE,
-    "sad": Emotion.TRAUER,
-    "sadness": Emotion.TRAUER,
-    "fear": Emotion.ANGST,
-    "scared": Emotion.ANGST,
-    "tired": Emotion.MÜDE,
-    "sleepy": Emotion.MÜDE,
-    "thinking": Emotion.NACHDENKEN,
-    "ponder": Emotion.NACHDENKEN,
-    "dance": Emotion.TANZEN,
-    "dancing": Emotion.TANZEN,
-    "surprise": Emotion.ÜBERRASCHUNG,
-    "surprised": Emotion.ÜBERRASCHUNG,
-    "curious": Emotion.NEUGIER,
-    "curiosity": Emotion.NEUGIER,
+    "joy": Emotion.FREUDE, "happy": Emotion.FREUDE, "happiness": Emotion.FREUDE,
+    "sad": Emotion.TRAUER, "sadness": Emotion.TRAUER,
+    "fear": Emotion.ANGST, "scared": Emotion.ANGST,
+    "tired": Emotion.MÜDE, "sleepy": Emotion.MÜDE,
+    "thinking": Emotion.NACHDENKEN, "ponder": Emotion.NACHDENKEN,
+    "dance": Emotion.TANZEN, "dancing": Emotion.TANZEN,
+    "surprise": Emotion.ÜBERRASCHUNG, "surprised": Emotion.ÜBERRASCHUNG,
+    "curious": Emotion.NEUGIER, "curiosity": Emotion.NEUGIER,
 })
+
+# Candidate RecordedMoves names per emotion (tried in order; first match wins)
+_RECORDED_CANDIDATES: dict[Emotion, list[str]] = {
+    Emotion.FREUDE:       ["happy", "joy", "excited", "freude"],
+    Emotion.TRAUER:       ["sad", "sadness", "unhappy", "trauer"],
+    Emotion.ANGST:        ["scared", "fear", "anxious", "angst"],
+    Emotion.MÜDE:         ["tired", "sleepy", "yawn", "müde"],
+    Emotion.NACHDENKEN:   ["thinking", "ponder", "curious", "nachdenken"],
+    Emotion.ÜBERRASCHUNG: ["surprised", "surprise", "shock", "ueberraschung"],
+    Emotion.NEUGIER:      ["curious", "interested", "wonder", "neugier"],
+    Emotion.NEUTRAL:      ["neutral"],
+    Emotion.TANZEN:       ["happy", "excited"],   # fallback if no dance library
+}
 
 
 def parse_emotion(label: str) -> Emotion:
@@ -70,78 +75,52 @@ def parse_emotion(label: str) -> Emotion:
 
 
 # ---------------------------------------------------------------------------
-# Keyframe data model
+# Legacy keyframe data (used in simulation / fallback mode)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Keyframe:
-    """A single pose snapshot in an animation."""
-    t:        float   # time offset in seconds from animation start
-    pitch:    float   # neck pitch    (°) — positive = head up
-    yaw:      float   # neck yaw      (°) — positive = head right
-    roll:     float   # neck roll     (°) — positive = tilt right
-    l_ant:    float   # left  antenna (°)
-    r_ant:    float   # right antenna (°)
-    body_yaw: float = 0.0  # body rotation (°) — positive = rotate right; ±160° limit
+    t: float; pitch: float; yaw: float; roll: float; l_ant: float; r_ant: float
+    body_yaw: float = 0.0
 
 
 @dataclass
 class Animation:
     keyframes: list[Keyframe]
-    loop: bool = False       # repeat keyframes indefinitely
-    loop_count: int = 0      # 0 = infinite when loop=True
+    loop: bool = False
+    loop_count: int = 0
 
 
 def _coslerp(a: float, b: float, t: float) -> float:
-    """Cosine-smoothed interpolation — nicer than raw linear."""
     t2 = (1.0 - math.cos(t * math.pi)) / 2.0
     return a + (b - a) * t2
 
 
-def interpolate(kfs: list[Keyframe], t: float) -> Keyframe:
-    """Return interpolated pose at time *t* (clamped to animation bounds)."""
+def _interpolate(kfs: list[Keyframe], t: float) -> Keyframe:
     if t <= kfs[0].t:
         return kfs[0]
     if t >= kfs[-1].t:
         return kfs[-1]
-
     for i in range(len(kfs) - 1):
         k0, k1 = kfs[i], kfs[i + 1]
         if k0.t <= t <= k1.t:
             span = k1.t - k0.t
-            alpha = (t - k0.t) / span if span > 0 else 1.0
+            a = (t - k0.t) / span if span > 0 else 1.0
             return Keyframe(
                 t=t,
-                pitch=   _coslerp(k0.pitch,    k1.pitch,    alpha),
-                yaw=     _coslerp(k0.yaw,       k1.yaw,      alpha),
-                roll=    _coslerp(k0.roll,      k1.roll,     alpha),
-                l_ant=   _coslerp(k0.l_ant,     k1.l_ant,    alpha),
-                r_ant=   _coslerp(k0.r_ant,     k1.r_ant,    alpha),
-                body_yaw=_coslerp(k0.body_yaw,  k1.body_yaw, alpha),
+                pitch=_coslerp(k0.pitch, k1.pitch, a),
+                yaw=_coslerp(k0.yaw, k1.yaw, a),
+                roll=_coslerp(k0.roll, k1.roll, a),
+                l_ant=_coslerp(k0.l_ant, k1.l_ant, a),
+                r_ant=_coslerp(k0.r_ant, k1.r_ant, a),
+                body_yaw=_coslerp(k0.body_yaw, k1.body_yaw, a),
             )
     return kfs[-1]
 
 
-# ---------------------------------------------------------------------------
-# Animation library
-# ---------------------------------------------------------------------------
-#
-# Antenna convention used here:
-#   0°  = resting / horizontal
-#  +60° = raised high (excited)
-#  -45° = drooped down (sad/scared)
-#
-# Neck convention (reachy-mini / create_head_pose):
-#   pitch: +20 = head up,  -20 = head down
-#   yaw:   +30 = head right, -30 = head left
-#   roll:  +15 = tilt right, -15 = tilt left
-
 NEUTRAL_POSE = Keyframe(t=0.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)
+SLEEP_POSE   = Keyframe(t=0.0, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38)
 
-# Final resting pose used by sleep_mode() — head drooped, antennas down
-SLEEP_POSE = Keyframe(t=0.0, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38)
-
-# Smooth droop animation for entering sleep (no jerk-awake, no glide back)
 _DROOP_TO_SLEEP = Animation(keyframes=[
     Keyframe(t=0.0, pitch=0,   yaw=0, roll=0,  l_ant=0,   r_ant=0),
     Keyframe(t=2.0, pitch=-8,  yaw=0, roll=10, l_ant=-15, r_ant=-15),
@@ -149,185 +128,140 @@ _DROOP_TO_SLEEP = Animation(keyframes=[
     Keyframe(t=6.0, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38),
 ])
 
-ANIMATIONS: dict[Emotion, Animation] = {
-
+_LEGACY_ANIMATIONS: dict[Emotion, Animation] = {
     Emotion.NEUTRAL: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=0.6, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
+        Keyframe(t=0.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0),
+        Keyframe(t=0.6, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # FREUDE — bouncy head bobs, antennas spring up and wiggle
     Emotion.FREUDE: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=0.2, pitch=12,  yaw=8,   roll=5,   l_ant=50,  r_ant=50),
-        Keyframe(t=0.4, pitch=-3,  yaw=-5,  roll=-3,  l_ant=20,  r_ant=20),
-        Keyframe(t=0.6, pitch=12,  yaw=8,   roll=5,   l_ant=55,  r_ant=40),
-        Keyframe(t=0.8, pitch=-3,  yaw=-5,  roll=-3,  l_ant=25,  r_ant=25),
-        Keyframe(t=1.0, pitch=10,  yaw=5,   roll=3,   l_ant=45,  r_ant=55),
-        Keyframe(t=1.2, pitch=-3,  yaw=-3,  roll=-2,  l_ant=20,  r_ant=20),
-        Keyframe(t=1.5, pitch=5,   yaw=0,   roll=0,   l_ant=35,  r_ant=35),
-        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
+        Keyframe(t=0.0, pitch=0,  yaw=0,  roll=0,  l_ant=0,  r_ant=0),
+        Keyframe(t=0.2, pitch=12, yaw=8,  roll=5,  l_ant=50, r_ant=50),
+        Keyframe(t=0.4, pitch=-3, yaw=-5, roll=-3, l_ant=20, r_ant=20),
+        Keyframe(t=0.6, pitch=12, yaw=8,  roll=5,  l_ant=55, r_ant=40),
+        Keyframe(t=0.8, pitch=-3, yaw=-5, roll=-3, l_ant=25, r_ant=25),
+        Keyframe(t=1.0, pitch=10, yaw=5,  roll=3,  l_ant=45, r_ant=55),
+        Keyframe(t=1.5, pitch=5,  yaw=0,  roll=0,  l_ant=35, r_ant=35),
+        Keyframe(t=2.0, pitch=0,  yaw=0,  roll=0,  l_ant=0,  r_ant=0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # TRAUER — slow droop forward, antennas hang down, slight head tilt
     Emotion.TRAUER: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=1.2, pitch=-8,  yaw=-2,  roll=6,   l_ant=-25, r_ant=-25),
-        Keyframe(t=2.5, pitch=-14, yaw=-4,  roll=10,  l_ant=-40, r_ant=-40),
-        Keyframe(t=4.0, pitch=-16, yaw=-4,  roll=10,  l_ant=-45, r_ant=-45),
-        Keyframe(t=5.5, pitch=-14, yaw=-2,  roll=8,   l_ant=-40, r_ant=-40),
-        Keyframe(t=7.0, pitch=-16, yaw=-4,  roll=10,  l_ant=-45, r_ant=-45),
+        Keyframe(t=0.0, pitch=0,   yaw=0,  roll=0,  l_ant=0,   r_ant=0),
+        Keyframe(t=2.5, pitch=-14, yaw=-4, roll=10, l_ant=-40, r_ant=-40),
+        Keyframe(t=5.5, pitch=-14, yaw=-2, roll=8,  l_ant=-40, r_ant=-40),
+        Keyframe(t=7.0, pitch=-16, yaw=-4, roll=10, l_ant=-45, r_ant=-45),
     ]),
-
-    # -----------------------------------------------------------------------
-    # ANGST — fast head shaking, both antennas pressed down/trembling
     Emotion.ANGST: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=-3,  yaw=0,   roll=0,   l_ant=-15, r_ant=-15),
-        Keyframe(t=0.10, pitch=-4, yaw=-12, roll=0,   l_ant=-25, r_ant=-30),
-        Keyframe(t=0.20, pitch=-4, yaw=12,  roll=0,   l_ant=-30, r_ant=-25),
-        Keyframe(t=0.30, pitch=-4, yaw=-10, roll=0,   l_ant=-28, r_ant=-32),
-        Keyframe(t=0.40, pitch=-4, yaw=10,  roll=0,   l_ant=-32, r_ant=-28),
-        Keyframe(t=0.50, pitch=-4, yaw=-8,  roll=0,   l_ant=-30, r_ant=-30),
-        Keyframe(t=0.60, pitch=-4, yaw=8,   roll=0,   l_ant=-30, r_ant=-30),
-        Keyframe(t=0.70, pitch=-4, yaw=-5,  roll=0,   l_ant=-25, r_ant=-25),
-        Keyframe(t=0.85, pitch=-3, yaw=0,   roll=0,   l_ant=-20, r_ant=-20),
-        Keyframe(t=1.5,  pitch=-3, yaw=0,   roll=0,   l_ant=-20, r_ant=-20),
-        Keyframe(t=2.2,  pitch=0,  yaw=0,   roll=0,   l_ant=0,   r_ant=0),
+        Keyframe(t=0.0,  pitch=-3, yaw=0,   roll=0, l_ant=-15, r_ant=-15),
+        Keyframe(t=0.10, pitch=-4, yaw=-12, roll=0, l_ant=-25, r_ant=-30),
+        Keyframe(t=0.20, pitch=-4, yaw=12,  roll=0, l_ant=-30, r_ant=-25),
+        Keyframe(t=0.30, pitch=-4, yaw=-10, roll=0, l_ant=-28, r_ant=-32),
+        Keyframe(t=0.40, pitch=-4, yaw=10,  roll=0, l_ant=-32, r_ant=-28),
+        Keyframe(t=0.85, pitch=-3, yaw=0,   roll=0, l_ant=-20, r_ant=-20),
+        Keyframe(t=2.2,  pitch=0,  yaw=0,   roll=0, l_ant=0,   r_ant=0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # MÜDE — very slow droop; a small involuntary "jerk awake" mid-way
     Emotion.MÜDE: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,  roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=1.5, pitch=-5,  yaw=0,  roll=8,   l_ant=-10, r_ant=-10),
-        Keyframe(t=3.0, pitch=-10, yaw=0,  roll=14,  l_ant=-20, r_ant=-20),
-        Keyframe(t=5.0, pitch=-16, yaw=0,  roll=18,  l_ant=-32, r_ant=-32),
-        Keyframe(t=6.5, pitch=-18, yaw=0,  roll=20,  l_ant=-38, r_ant=-38),
-        # jerk awake
-        Keyframe(t=7.0, pitch=-4,  yaw=0,  roll=4,   l_ant=8,   r_ant=8),
-        # droop again
-        Keyframe(t=8.5, pitch=-16, yaw=0,  roll=18,  l_ant=-32, r_ant=-32),
-        Keyframe(t=9.5, pitch=-18, yaw=0,  roll=20,  l_ant=-38, r_ant=-38),
+        Keyframe(t=0.0, pitch=0,   yaw=0, roll=0,  l_ant=0,   r_ant=0),
+        Keyframe(t=3.0, pitch=-10, yaw=0, roll=14, l_ant=-20, r_ant=-20),
+        Keyframe(t=6.5, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38),
+        Keyframe(t=7.0, pitch=-4,  yaw=0, roll=4,  l_ant=8,   r_ant=8),
+        Keyframe(t=9.5, pitch=-18, yaw=0, roll=20, l_ant=-38, r_ant=-38),
     ]),
-
-    # -----------------------------------------------------------------------
-    # NACHDENKEN — head tilts right + up, left antenna raised, small sways
     Emotion.NACHDENKEN: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,  yaw=0,   roll=0,   l_ant=0,  r_ant=0),
-        Keyframe(t=0.7, pitch=6,  yaw=6,   roll=14,  l_ant=45, r_ant=5),
-        Keyframe(t=2.0, pitch=6,  yaw=6,   roll=14,  l_ant=45, r_ant=5),
-        # slight re-consideration sway
-        Keyframe(t=2.6, pitch=5,  yaw=-4,  roll=10,  l_ant=45, r_ant=15),
-        Keyframe(t=3.2, pitch=6,  yaw=6,   roll=14,  l_ant=45, r_ant=5),
-        Keyframe(t=4.2, pitch=6,  yaw=6,   roll=14,  l_ant=45, r_ant=5),
-        # small antenna tap
-        Keyframe(t=4.5, pitch=6,  yaw=6,   roll=14,  l_ant=55, r_ant=5),
-        Keyframe(t=4.8, pitch=6,  yaw=6,   roll=14,  l_ant=45, r_ant=5),
-        Keyframe(t=5.5, pitch=0,  yaw=0,   roll=0,   l_ant=0,  r_ant=0),
+        Keyframe(t=0.0, pitch=0, yaw=0,  roll=0,  l_ant=0,  r_ant=0),
+        Keyframe(t=0.7, pitch=6, yaw=6,  roll=14, l_ant=45, r_ant=5),
+        Keyframe(t=2.6, pitch=5, yaw=-4, roll=10, l_ant=45, r_ant=15),
+        Keyframe(t=4.5, pitch=6, yaw=6,  roll=14, l_ant=55, r_ant=5),
+        Keyframe(t=5.5, pitch=0, yaw=0,  roll=0,  l_ant=0,  r_ant=0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # TANZEN — slow graceful sway: head left/right, antennas counter-sway,
-    # body rotates gently with each beat.
-    # Period 3.0 s × 4 loops ≈ 12 s total.
-    # All values well within safe limits (head yaw ±20° of ±180°,
-    # body yaw ±8° of ±160°, head–body delta ≤ 28° of 65° limit).
     Emotion.TANZEN: Animation(loop=True, loop_count=4, keyframes=[
-        # centre — ready
-        Keyframe(t=0.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
-        # sway RIGHT — head right, left antenna up, right antenna dips, body right
-        Keyframe(t=0.75, pitch=5, yaw=20,  roll=12,  l_ant=45,  r_ant=-10, body_yaw= 8.0),
-        # return to centre
-        Keyframe(t=1.5,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
-        # sway LEFT — head left, right antenna up, left antenna dips, body left
+        Keyframe(t=0.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw=0.0),
+        Keyframe(t=0.75, pitch=5, yaw=20,  roll=12,  l_ant=45,  r_ant=-10, body_yaw=8.0),
+        Keyframe(t=1.5,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw=0.0),
         Keyframe(t=2.25, pitch=5, yaw=-20, roll=-12, l_ant=-10, r_ant=45,  body_yaw=-8.0),
-        # return to centre
-        Keyframe(t=3.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw= 0.0),
+        Keyframe(t=3.0,  pitch=2, yaw=0,   roll=0,   l_ant=10,  r_ant=10,  body_yaw=0.0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # ÜBERRASCHUNG — sharp snap back, antennas shoot up, then settle
     Emotion.ÜBERRASCHUNG: Animation(keyframes=[
-        Keyframe(t=0.0,  pitch=0,   yaw=0,  roll=0,  l_ant=0,   r_ant=0),
-        Keyframe(t=0.08, pitch=18,  yaw=0,  roll=0,  l_ant=60,  r_ant=60),
-        Keyframe(t=0.25, pitch=20,  yaw=0,  roll=0,  l_ant=65,  r_ant=65),
-        Keyframe(t=0.6,  pitch=15,  yaw=0,  roll=0,  l_ant=50,  r_ant=50),
-        Keyframe(t=1.2,  pitch=8,   yaw=0,  roll=0,  l_ant=25,  r_ant=25),
-        Keyframe(t=2.0,  pitch=0,   yaw=0,  roll=0,  l_ant=0,   r_ant=0),
+        Keyframe(t=0.0,  pitch=0,  yaw=0, roll=0, l_ant=0,  r_ant=0),
+        Keyframe(t=0.08, pitch=18, yaw=0, roll=0, l_ant=60, r_ant=60),
+        Keyframe(t=0.25, pitch=20, yaw=0, roll=0, l_ant=65, r_ant=65),
+        Keyframe(t=1.2,  pitch=8,  yaw=0, roll=0, l_ant=25, r_ant=25),
+        Keyframe(t=2.0,  pitch=0,  yaw=0, roll=0, l_ant=0,  r_ant=0),
     ]),
-
-    # -----------------------------------------------------------------------
-    # NEUGIER — head leans forward+sideways, antennas perk up equally
     Emotion.NEUGIER: Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
-        Keyframe(t=0.6, pitch=10,  yaw=12,  roll=10,  l_ant=25,  r_ant=25),
-        Keyframe(t=1.8, pitch=10,  yaw=12,  roll=10,  l_ant=25,  r_ant=25),
-        # tilt other way briefly — comparing
-        Keyframe(t=2.3, pitch=10,  yaw=-6,  roll=-5,  l_ant=20,  r_ant=30),
-        Keyframe(t=3.0, pitch=10,  yaw=12,  roll=10,  l_ant=25,  r_ant=25),
-        Keyframe(t=4.0, pitch=10,  yaw=12,  roll=10,  l_ant=25,  r_ant=25),
-        Keyframe(t=5.0, pitch=0,   yaw=0,   roll=0,   l_ant=0,   r_ant=0),
+        Keyframe(t=0.0, pitch=0,  yaw=0,  roll=0,  l_ant=0,  r_ant=0),
+        Keyframe(t=0.6, pitch=10, yaw=12, roll=10, l_ant=25, r_ant=25),
+        Keyframe(t=2.3, pitch=10, yaw=-6, roll=-5, l_ant=20, r_ant=30),
+        Keyframe(t=4.0, pitch=10, yaw=12, roll=10, l_ant=25, r_ant=25),
+        Keyframe(t=5.0, pitch=0,  yaw=0,  roll=0,  l_ant=0,  r_ant=0),
     ]),
 }
-
-
-# ---------------------------------------------------------------------------
-# Directional head moves  (used by the move_head GPT tool)
-# ---------------------------------------------------------------------------
 
 _HEAD_MOVE_ANIMATIONS: dict[str, Animation] = {
-    "left": Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=-30, roll=0, l_ant=0, r_ant=0),
-        Keyframe(t=1.2, pitch=0,   yaw=-30, roll=0, l_ant=0, r_ant=0),
-        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
-    ]),
-    "right": Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=30,  roll=0, l_ant=0, r_ant=0),
-        Keyframe(t=1.2, pitch=0,   yaw=30,  roll=0, l_ant=0, r_ant=0),
-        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
-    ]),
-    "up": Animation(keyframes=[
-        Keyframe(t=0.0, pitch=15,  yaw=0,   roll=0, l_ant=15, r_ant=15),
-        Keyframe(t=1.2, pitch=15,  yaw=0,   roll=0, l_ant=15, r_ant=15),
-        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0,  r_ant=0),
-    ]),
-    "down": Animation(keyframes=[
-        Keyframe(t=0.0, pitch=-12, yaw=0,   roll=0, l_ant=-10, r_ant=-10),
-        Keyframe(t=1.2, pitch=-12, yaw=0,   roll=0, l_ant=-10, r_ant=-10),
-        Keyframe(t=2.0, pitch=0,   yaw=0,   roll=0, l_ant=0,   r_ant=0),
-    ]),
-    "front": Animation(keyframes=[
-        Keyframe(t=0.0, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
-        Keyframe(t=0.6, pitch=0,   yaw=0,   roll=0, l_ant=0, r_ant=0),
-    ]),
+    "left":  Animation(keyframes=[Keyframe(t=0.0, pitch=0, yaw=-30, roll=0, l_ant=0, r_ant=0), Keyframe(t=1.2, pitch=0, yaw=-30, roll=0, l_ant=0, r_ant=0), Keyframe(t=2.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)]),
+    "right": Animation(keyframes=[Keyframe(t=0.0, pitch=0, yaw=30,  roll=0, l_ant=0, r_ant=0), Keyframe(t=1.2, pitch=0, yaw=30,  roll=0, l_ant=0, r_ant=0), Keyframe(t=2.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)]),
+    "up":    Animation(keyframes=[Keyframe(t=0.0, pitch=15, yaw=0, roll=0, l_ant=15, r_ant=15), Keyframe(t=1.2, pitch=15, yaw=0, roll=0, l_ant=15, r_ant=15), Keyframe(t=2.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)]),
+    "down":  Animation(keyframes=[Keyframe(t=0.0, pitch=-12, yaw=0, roll=0, l_ant=-10, r_ant=-10), Keyframe(t=1.2, pitch=-12, yaw=0, roll=0, l_ant=-10, r_ant=-10), Keyframe(t=2.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)]),
+    "front": Animation(keyframes=[Keyframe(t=0.0, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0), Keyframe(t=0.6, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)]),
 }
 
+_TICK = 0.04   # legacy keyframe tick rate (25 Hz)
+
 
 # ---------------------------------------------------------------------------
-# Emotion engine
+# EmotionEngine
 # ---------------------------------------------------------------------------
-
-TICK = 0.04   # seconds between pose updates (~25 Hz)
-
 
 class EmotionEngine:
     """
-    Plays keyframe animations on Reachy Mini's head and antennas.
-
-    Parameters
-    ----------
-    reachy : reachy_mini.ReachyMini or None
-        None → simulation / logging only.
+    Play emotions via MovementManager + RecordedMoves (robot mode)
+    or legacy keyframe animations (simulation / fallback).
     """
 
-    def __init__(self, reachy=None) -> None:
+    def __init__(self, reachy=None, movement_manager: Optional["MovementManager"] = None) -> None:
         self.reachy = reachy
+        self.movement_manager = movement_manager
+
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._current_emotion = Emotion.NEUTRAL
+
+        # Try to load SDK animation libraries (only available on the robot)
+        self._recorded_moves = None
+        self._available_emotions: list[str] = []
+        self._dance_available = False
+        self._available_dances: list[str] = []
+
+        if reachy is not None:
+            self._try_load_recorded_moves()
+            self._try_load_dance_library()
+
+    def _try_load_recorded_moves(self) -> None:
+        try:
+            from reachy_mini.motion.recorded_move import RecordedMoves
+            self._recorded_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+            self._available_emotions = list(self._recorded_moves.list_moves())
+            logger.info("RecordedMoves loaded — available: %s", self._available_emotions)
+        except Exception as e:
+            logger.warning("RecordedMoves unavailable (%s) — using keyframe fallback", e)
+
+    def _try_load_dance_library(self) -> None:
+        try:
+            from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
+            self._available_dances = list(AVAILABLE_MOVES.keys())
+            self._dance_available = bool(self._available_dances)
+            if self._dance_available:
+                logger.info("Dance library loaded — available: %s", self._available_dances)
+        except Exception as e:
+            logger.warning("Dance library unavailable (%s)", e)
+
+    def _map_to_recorded(self, emotion: Emotion) -> Optional[str]:
+        """Return the first matching RecordedMoves name for this emotion, or None."""
+        for candidate in _RECORDED_CANDIDATES.get(emotion, []):
+            if candidate in self._available_emotions:
+                return candidate
+        if emotion.value in self._available_emotions:
+            return emotion.value
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -343,120 +277,184 @@ class EmotionEngine:
             self._current_emotion = emotion
 
     def play(self, emotion: Emotion, *, block: bool = False) -> None:
-        """
-        Play *emotion* animation.  Any currently running animation is
-        cancelled immediately.  Set block=True to wait for completion.
-        """
-        self._cancel()
-        # Only clear stop_evt after the previous thread has had a chance to stop.
-        # _cancel() already called join(timeout=0.5), so this is as safe as we can
-        # make it without blocking indefinitely on a stuck robot SDK call.
-        self._stop_evt.clear()
+        """Play an emotion animation. Non-blocking unless block=True."""
         self._set_emotion(emotion)
-        anim = ANIMATIONS.get(emotion, ANIMATIONS[Emotion.NEUTRAL])
+        logger.info("[emotion] %s", emotion.value)
 
+        if self.movement_manager is not None and self.reachy is not None:
+            self._play_via_manager(emotion, block=block)
+        else:
+            self._play_legacy(emotion, block=block)
+
+    def _play_via_manager(self, emotion: Emotion, *, block: bool) -> None:
+        """Queue the emotion via MovementManager using SDK pre-recorded animations."""
+        from modules.dance_emotion_moves import EmotionQueueMove, DanceQueueMove
+
+        if emotion == Emotion.TANZEN and self._dance_available:
+            import random
+            from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
+            name = random.choice(self._available_dances)
+            move = DanceQueueMove(name)
+            self.movement_manager.queue_move(move)
+            if block:
+                time.sleep(move.duration)
+            return
+
+        if self._recorded_moves is not None:
+            name = self._map_to_recorded(emotion)
+            if name is not None:
+                move = EmotionQueueMove(name, self._recorded_moves)
+                self.movement_manager.queue_move(move)
+                if block:
+                    dur = move.duration
+                    if dur < float("inf"):
+                        time.sleep(dur)
+                return
+
+        # Fallback: no RecordedMoves for this emotion → use legacy keyframes
+        # Legacy keyframes call set_target directly; pause movement_manager?
+        # We skip the direct SDK calls in sim-less legacy mode for safety.
+        logger.debug("[emotion] no RecordedMoves for %s — skipping (manager mode)", emotion.value)
+
+    def _play_legacy(self, emotion: Emotion, *, block: bool) -> None:
+        """Play via old keyframe animations (sim mode or fallback)."""
+        self._cancel()
+        self._stop_evt.clear()
+        anim = _LEGACY_ANIMATIONS.get(emotion, _LEGACY_ANIMATIONS[Emotion.NEUTRAL])
         self._thread = threading.Thread(
-            target=self._run,
-            args=(anim,),
-            name=f"emotion-{emotion.value}",
-            daemon=True,
+            target=self._run_legacy, args=(anim,),
+            name=f"emotion-{emotion.value}", daemon=True,
         )
         self._thread.start()
-        logger.info("[emotion] playing: %s", emotion.value)
-
         if block:
             self._thread.join()
 
     def stop(self) -> None:
-        """Stop current animation and return to neutral pose."""
+        """Stop current animation and return to neutral."""
         self._cancel()
-        self._apply(NEUTRAL_POSE)
+        self._apply_legacy(NEUTRAL_POSE)
         self._set_emotion(Emotion.NEUTRAL)
 
     def sleep_mode(self) -> None:
-        """
-        Slowly droop head and antennas to sleep pose (blocks ~6 s in the
-        calling thread), then hold the pose in background until play() or
-        stop() is called.  Use with a wake-word listen loop in the caller.
-        """
+        """Droop head/antennas to sleep pose over ~6 s, then hold."""
+        self._set_emotion(Emotion.MÜDE)
         self._cancel()
         self._stop_evt.clear()
-        self._set_emotion(Emotion.MÜDE)
         logger.info("[emotion] entering sleep mode")
 
-        # Run the droop in-thread so the caller can await it naturally
+        if self.movement_manager is not None and self.reachy is not None:
+            self._sleep_via_manager()
+        else:
+            self._sleep_legacy()
+
+    def _sleep_via_manager(self) -> None:
+        """Queue droop + hold moves via MovementManager."""
+        try:
+            from reachy_mini.utils import create_head_pose
+            from modules.dance_emotion_moves import GotoQueueMove
+
+            sleep_head = create_head_pose(pitch=-18, yaw=0, roll=20, degrees=True)
+            sleep_antennas_rad = math.radians(-38)
+            droop = GotoQueueMove(
+                target_head_pose=sleep_head,
+                target_antennas=(sleep_antennas_rad, sleep_antennas_rad),
+                target_body_yaw=0.0,
+                duration=6.0,
+            )
+            self.movement_manager.queue_move(droop)
+            # Block so caller knows the droop has finished before starting the wake loop
+            time.sleep(6.5)
+        except Exception as e:
+            logger.warning("sleep_via_manager failed: %s", e)
+            self._sleep_legacy()
+
+    def _sleep_legacy(self) -> None:
+        """Keyframe droop to sleep, then hold in background thread."""
         t_start = time.monotonic()
         duration = _DROOP_TO_SLEEP.keyframes[-1].t
         while not self._stop_evt.is_set():
             elapsed = time.monotonic() - t_start
             if elapsed >= duration:
                 break
-            self._apply(interpolate(_DROOP_TO_SLEEP.keyframes, elapsed))
-            time.sleep(TICK)
-
+            self._apply_legacy(_interpolate(_DROOP_TO_SLEEP.keyframes, elapsed))
+            time.sleep(_TICK)
         if self._stop_evt.is_set():
             return
-
-        # Snap to exact sleep pose, then keep refreshing it in background
-        self._apply(SLEEP_POSE)
+        self._apply_legacy(SLEEP_POSE)
         self._stop_evt.clear()
         self._thread = threading.Thread(
-            target=self._hold_static,
-            args=(SLEEP_POSE,),
-            daemon=True,
-            name="emotion-sleep-hold",
+            target=self._hold_static_legacy, args=(SLEEP_POSE,),
+            daemon=True, name="emotion-sleep-hold",
         )
         self._thread.start()
-        logger.info("[emotion] sleep pose held")
 
     def idle(self) -> None:
-        """Return gently to neutral (used when no face is detected)."""
+        """Gently return to neutral when no face is detected."""
         if self.current_emotion != Emotion.NEUTRAL:
             self.play(Emotion.NEUTRAL)
 
     def move_head(self, direction: str) -> None:
-        """
-        Move head to a named direction, hold briefly, then return to neutral.
+        """Move head to a named direction then return to neutral."""
+        if self.movement_manager is not None and self.reachy is not None:
+            self._move_head_via_manager(direction)
+        else:
+            anim = _HEAD_MOVE_ANIMATIONS.get(direction.lower())
+            if anim is None:
+                logger.warning("move_head: unknown direction %r", direction)
+                return
+            self._cancel()
+            self._stop_evt.clear()
+            self._thread = threading.Thread(
+                target=self._run_legacy, args=(anim,),
+                name=f"head-{direction}", daemon=True,
+            )
+            self._thread.start()
 
-        direction : "left" | "right" | "up" | "down" | "front"
-        """
-        anim = _HEAD_MOVE_ANIMATIONS.get(direction.lower())
-        if anim is None:
-            logger.warning("move_head: unknown direction %r", direction)
-            return
-        self._cancel()
-        self._stop_evt.clear()
-        self._set_emotion(Emotion.NEUTRAL)
-        self._thread = threading.Thread(
-            target=self._run, args=(anim,), name=f"head-{direction}", daemon=True
-        )
-        self._thread.start()
-        logger.info("[emotion] move_head(%s)", direction)
+    def _move_head_via_manager(self, direction: str) -> None:
+        try:
+            from reachy_mini.utils import create_head_pose
+            from modules.dance_emotion_moves import GotoQueueMove
+
+            _DELTAS = {
+                "left":  (0, 0, 0, 0, 0,  40),
+                "right": (0, 0, 0, 0, 0, -40),
+                "up":    (0, 0, 0, 0, -30, 0),
+                "down":  (0, 0, 0, 0,  30, 0),
+                "front": (0, 0, 0, 0,   0, 0),
+            }
+            deltas = _DELTAS.get(direction.lower(), (0, 0, 0, 0, 0, 0))
+            target = create_head_pose(*deltas, degrees=True)
+            current_head = self.reachy.get_current_head_pose()
+            _, current_ants = self.reachy.get_current_joint_positions()
+            hold = GotoQueueMove(target_head_pose=target, start_head_pose=current_head,
+                                 target_antennas=(0, 0), start_antennas=(current_ants[0], current_ants[1]),
+                                 duration=0.8)
+            back = GotoQueueMove(target_head_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+                                 target_antennas=(0, 0), duration=0.8)
+            self.movement_manager.queue_move(hold)
+            self.movement_manager.queue_move(back)
+        except Exception as e:
+            logger.warning("move_head_via_manager failed: %s", e)
 
     # ------------------------------------------------------------------
-    # Animation runner
+    # Legacy keyframe helpers
     # ------------------------------------------------------------------
-
-    def _hold_static(self, pose: Keyframe) -> None:
-        """Refresh a single static pose at ~5 Hz until _stop_evt is set."""
-        while not self._stop_evt.is_set():
-            self._apply(pose)
-            time.sleep(TICK * 5)
 
     def _cancel(self) -> None:
         self._stop_evt.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
-            if self._thread.is_alive():
-                # Robot SDK call may still be in-flight; log and continue —
-                # _stop_evt remains set so the thread will exit on its next check.
-                logger.debug("_cancel: animation thread did not stop within timeout")
 
-    def _run(self, anim: Animation) -> None:
+    def _hold_static_legacy(self, pose: Keyframe) -> None:
+        while not self._stop_evt.is_set():
+            self._apply_legacy(pose)
+            time.sleep(_TICK * 5)
+
+    def _run_legacy(self, anim: Animation) -> None:
         uses_body = any(abs(kf.body_yaw) >= 0.1 for kf in anim.keyframes)
-        repeats = 0
         max_repeats = anim.loop_count if (anim.loop and anim.loop_count > 0) else (999 if anim.loop else 1)
         duration = anim.keyframes[-1].t
+        repeats = 0
 
         while repeats < max_repeats and not self._stop_evt.is_set():
             t_start = time.monotonic()
@@ -464,86 +462,54 @@ class EmotionEngine:
                 elapsed = time.monotonic() - t_start
                 if elapsed >= duration:
                     break
-                pose = interpolate(anim.keyframes, elapsed)
-                self._apply(pose, send_body=uses_body)
-                time.sleep(TICK)
-
-            # Hold the final frame for one tick before looping/ending
+                self._apply_legacy(_interpolate(anim.keyframes, elapsed), send_body=uses_body)
+                time.sleep(_TICK)
             if not self._stop_evt.is_set():
-                self._apply(anim.keyframes[-1], send_body=uses_body)
+                self._apply_legacy(anim.keyframes[-1], send_body=uses_body)
             repeats += 1
 
-        # Always glide back to neutral when done (unless interrupted externally)
         if not self._stop_evt.is_set():
             if uses_body:
-                self._reset_body_yaw(duration=0.8)
-            self._glide_to_neutral(duration=0.8)
+                self._reset_body_yaw_legacy()
+            self._glide_to_neutral_legacy()
             self._set_emotion(Emotion.NEUTRAL)
 
-    def _glide_to_neutral(self, duration: float = 0.8) -> None:
-        """Smoothly interpolate from current pose to neutral."""
-        # Build a two-keyframe mini-animation
-        last_pose = NEUTRAL_POSE  # safe approximation; robot tracks last goal_position
-        glide = Animation(keyframes=[
-            Keyframe(t=0.0, **{f: getattr(last_pose, f) for f in ("pitch","yaw","roll","l_ant","r_ant")}),
-            Keyframe(t=duration, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0),
-        ])
+    def _glide_to_neutral_legacy(self, duration: float = 0.8) -> None:
+        glide = Animation(keyframes=[NEUTRAL_POSE, Keyframe(t=duration, pitch=0, yaw=0, roll=0, l_ant=0, r_ant=0)])
         t_start = time.monotonic()
         while not self._stop_evt.is_set():
             elapsed = time.monotonic() - t_start
             if elapsed >= duration:
                 break
-            self._apply(interpolate(glide.keyframes, elapsed))
-            time.sleep(TICK)
-        self._apply(NEUTRAL_POSE)
+            self._apply_legacy(_interpolate(glide.keyframes, elapsed))
+            time.sleep(_TICK)
+        self._apply_legacy(NEUTRAL_POSE)
 
-    # ------------------------------------------------------------------
-    # Hardware interface
-    # ------------------------------------------------------------------
-
-    def _apply(self, pose: Keyframe, *, send_body: bool = False) -> None:
-        """Send *pose* to the robot, or log it in sim mode.
-
-        send_body — when True, also command body_yaw (used by animations
-        that explicitly animate the body, e.g. TANZEN).
-        """
+    def _apply_legacy(self, pose: Keyframe, *, send_body: bool = False) -> None:
         if self.reachy is None:
-            logger.debug(
-                "[sim] emotion  pitch=%+.1f  yaw=%+.1f  roll=%+.1f  "
-                "l_ant=%+.1f  r_ant=%+.1f  body_yaw=%+.1f",
-                pose.pitch, pose.yaw, pose.roll, pose.l_ant, pose.r_ant, pose.body_yaw,
-            )
+            logger.debug("[sim] pitch=%+.1f yaw=%+.1f roll=%+.1f l=%+.1f r=%+.1f",
+                         pose.pitch, pose.yaw, pose.roll, pose.l_ant, pose.r_ant)
             return
-
         try:
             from reachy_mini.utils import create_head_pose
-            head_pose = create_head_pose(
-                pitch=pose.pitch, yaw=pose.yaw, roll=pose.roll, degrees=True
-            )
-            # SDK antenna order: [right_rad, left_rad]
+            head_pose = create_head_pose(pitch=pose.pitch, yaw=pose.yaw, roll=pose.roll, degrees=True)
             antennas = np.deg2rad([pose.r_ant, pose.l_ant])
             self.reachy.set_target(head=head_pose, antennas=antennas)
         except Exception:
             logger.debug("Head/antenna command failed", exc_info=True)
-
         if send_body:
-            rad = math.radians(pose.body_yaw)
             try:
-                self.reachy.set_target_body_yaw(rad)
+                self.reachy.set_target_body_yaw(math.radians(pose.body_yaw))
             except AttributeError:
-                # Older SDK: use goto_target with a very short duration so
-                # the robot tracks our 25 Hz keyframe interpolation closely.
                 try:
-                    self.reachy.goto_target(body_yaw=rad, duration=TICK * 2)
+                    self.reachy.goto_target(body_yaw=math.radians(pose.body_yaw), duration=_TICK * 2)
                 except Exception:
-                    logger.debug("Body yaw command failed (goto_target)", exc_info=True)
+                    logger.debug("Body yaw command failed", exc_info=True)
             except Exception:
                 logger.debug("Body yaw command failed", exc_info=True)
 
-    def _reset_body_yaw(self, duration: float = 0.8) -> None:
-        """Smoothly return body to yaw=0 using SDK interpolation (non-blocking)."""
+    def _reset_body_yaw_legacy(self, duration: float = 0.8) -> None:
         if self.reachy is None:
-            logger.debug("[sim] body_yaw reset → 0°")
             return
         try:
             self.reachy.goto_target(body_yaw=0.0, duration=duration)
@@ -559,17 +525,12 @@ if __name__ == "__main__":
     import argparse
 
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s")
-
     parser = argparse.ArgumentParser(description="Emotion animation demo (no robot)")
     parser.add_argument("--demo", action="store_true", default=True)
-    parser.add_argument(
-        "--emotion",
-        default=None,
-        help="Play one emotion then exit (e.g. tanzen, freude, trauer)",
-    )
+    parser.add_argument("--emotion", default=None)
     args = parser.parse_args()
 
-    engine = EmotionEngine(reachy=None)  # sim mode
+    engine = EmotionEngine(reachy=None)
 
     if args.emotion:
         emo = parse_emotion(args.emotion)
