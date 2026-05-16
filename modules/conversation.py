@@ -404,6 +404,9 @@ class ConversationManager:
 
         self._session_history.append({"role": "user", "content": user_input})
         self._session_history.append({"role": "assistant", "content": reply})
+        # Keep at most 40 messages (20 turns) to prevent context-window overflow
+        if len(self._session_history) > 40:
+            self._session_history = self._session_history[-40:]
         logger.debug("Reply: %r  emotion: %s", reply[:80], emotion.value)
         return reply, emotion
 
@@ -577,6 +580,8 @@ class ConversationManager:
             self.last_reply = " ".join(reply_parts)
             self._session_history.append({"role": "user",      "content": user_input})
             self._session_history.append({"role": "assistant", "content": self.last_reply})
+            if len(self._session_history) > 40:
+                self._session_history = self._session_history[-40:]
             logger.debug("Stream done: %r  emotion=%s", self.last_reply[:80], self.last_emotion.value)
 
     def stream_chat(self, user_input: str) -> Generator[str, None, None]:

@@ -4,10 +4,10 @@ Reachy GPT App — main entry point.
 
 Threads:
   • camera_loop       – captures frames, runs Haar face detection (~30 fps)
-  • tracking_loop     – moves neck/body to follow face (20 Hz)
   • recognition_loop  – identifies person every N frames
   • idle_loop         – triggers MÜDE emotion when no face is seen for a while
   • conversation_loop – stdin → GPT-4o (with web search + vision) → stdout + TTS
+  • MovementManager   – 60 Hz control loop (daemon), owns all set_target() calls
 
 CLI flags:
   --no-robot          Run without a physical Reachy (simulation mode)
@@ -52,7 +52,7 @@ logger = logging.getLogger("main")
 # Local modules
 # ---------------------------------------------------------------------------
 from modules.conversation import ConversationManager
-from modules.emotions import Emotion, EmotionEngine, SLEEP_POSE
+from modules.emotions import Emotion, EmotionEngine
 from modules.face_tracking import FaceTracker, FacePosition
 from modules.moves import MovementManager
 from modules.face_recognition_module import FaceRecognitionModule
@@ -77,7 +77,6 @@ VISION_INTERVAL      = 30.0    # interval kept for VisionAnalyzer constructor (u
 IDLE_TIMEOUT         = 12.0    # seconds without a face before MÜDE animation
 CAMERA_INDEX         = int(os.environ.get("CAMERA_INDEX", "0"))
 UNKNOWN_PERSON_NAME  = "Stranger"
-
 
 
 # ---------------------------------------------------------------------------
