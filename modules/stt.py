@@ -64,15 +64,19 @@ CHUNK_SAMPLES = 1_600           # 0.1 s per VAD chunk
 # 0.020 works at ~0.5–1 m conversational distance with Reachy's mic array.
 # Raise if background noise triggers false detection; lower if speech is missed.
 # Override with STT_THRESHOLD in .env (run mic_selftest() to find your level).
-SPEECH_THRESHOLD = float(os.environ.get("STT_THRESHOLD", "0.020"))
+SPEECH_THRESHOLD = float(os.environ.get("STT_THRESHOLD", "0.030"))
 
 # Seconds of consecutive silence that ends a recording
 SILENCE_DURATION  = 0.8
 SILENCE_CHUNKS    = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)   # = 8
 
 # Minimum speech content before Whisper is called (discard very short bursts)
-MIN_SPEECH_DURATION = 0.5
-MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 5
+MIN_SPEECH_DURATION = 1.5
+MIN_SPEECH_CHUNKS   = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 15
+
+# Sustained speech required before recording begins (onset gate)
+SPEECH_ONSET_DURATION = 1.0
+SPEECH_ONSET_CHUNKS   = int(SPEECH_ONSET_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)  # = 10
 
 # Maximum recording time after speech onset (prevents runaway capture)
 MAX_RECORD_DURATION = 10.0
@@ -95,7 +99,7 @@ MAX_DURATION = 30.0
 _HALLUCINATION_EXACT: frozenset[str] = frozenset({
     # subtitle artefacts injected by Whisper's training data
     "amara", "amara.org", "untertitel von", "untertitel durch",
-    "untertitelung", "untertitel", "ondertitels",
+    "untertitelung", "untertitel", "ondertitels", "community",
     "sous-titres", "sous-titrage", "sous titres",
     "subtitles by", "subtitled by", "subtitling",
     "captions by", "transcribed by", "translated by",
@@ -410,8 +414,10 @@ class SpeechToText:
         runs, the mic is clean and no mid-loop muting is needed.
         """
         chunks:        list[np.ndarray] = []
+        pre_roll:      list[np.ndarray] = []  # chunks buffered during onset gate
         speech_chunks  = 0
         silence_chunks = 0
+        onset_chunks   = 0   # consecutive speech chunks seen before recording starts
         speech_started = False
         deadline       = time.monotonic() + timeout
 
@@ -435,19 +441,28 @@ class SpeechToText:
 
             if is_speech:
                 if not speech_started:
-                    speech_started = True
-                    logger.info("STT: Sprache erkannt (rms=%.4f, threshold=%.4f)",
-                                rms, SPEECH_THRESHOLD)
-                    print("✅ Sprache erkannt!", flush=True)
-                silence_chunks = 0
-                speech_chunks += 1
-                chunks.append(chunk)
+                    # Onset gate: require SPEECH_ONSET_CHUNKS consecutive speech
+                    # chunks before committing to a recording, to ignore brief noise.
+                    onset_chunks += 1
+                    pre_roll.append(chunk)
+                    if onset_chunks >= SPEECH_ONSET_CHUNKS:
+                        speech_started = True
+                        chunks = list(pre_roll)
+                        speech_chunks = len(chunks)
+                        pre_roll = []
+                        logger.info("STT: Sprache erkannt (rms=%.4f, threshold=%.4f)",
+                                    rms, SPEECH_THRESHOLD)
+                        print("✅ Sprache erkannt!", flush=True)
+                else:
+                    silence_chunks = 0
+                    speech_chunks += 1
+                    chunks.append(chunk)
 
-                # Hard cap: stop recording after MAX_RECORD_DURATION
-                if speech_chunks >= MAX_RECORD_CHUNKS:
-                    logger.info("STT: max Aufnahmedauer erreicht (%.0fs)", MAX_RECORD_DURATION)
-                    print(f"  ⏱️  Max. {MAX_RECORD_DURATION:.0f}s — sende an Whisper…", flush=True)
-                    break
+                    # Hard cap: stop recording after MAX_RECORD_DURATION
+                    if speech_chunks >= MAX_RECORD_CHUNKS:
+                        logger.info("STT: max Aufnahmedauer erreicht (%.0fs)", MAX_RECORD_DURATION)
+                        print(f"  ⏱️  Max. {MAX_RECORD_DURATION:.0f}s — sende an Whisper…", flush=True)
+                        break
 
             elif speech_started:
                 silence_chunks += 1
@@ -458,7 +473,10 @@ class SpeechToText:
                           flush=True)
                     break
 
-            # else: still waiting for speech onset — discard chunk
+            else:
+                # No speech and onset not yet reached — reset onset gate.
+                onset_chunks = 0
+                pre_roll.clear()
 
         if not speech_started or speech_chunks < MIN_SPEECH_CHUNKS:
             logger.debug(
@@ -502,6 +520,9 @@ class SpeechToText:
                 return None
             if _is_hallucination(text):
                 logger.info("STT: hallucination discarded: %r", text[:80])
+                return None
+            if len(text.split()) < 2:
+                logger.info("STT: too short (< 2 words) — discarded: %r", text[:80])
                 return None
             return text
         except openai.APIError as exc:
